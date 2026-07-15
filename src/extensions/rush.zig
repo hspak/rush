@@ -423,8 +423,12 @@ fn listAbbreviations(state: *State, sh: anytype) !result.EvalResult {
 
 fn isAbbreviationName(name: []const u8) bool {
     if (name.len == 0) return false;
-    if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
-    for (name[1..]) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    // Allow letters, digits, underscores, and periods so names like `..` work.
+    // The first character may not be a digit, matching shell variable-name style.
+    if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_' and name[0] != '.') return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '.') return false;
+    }
     return true;
 }
 
@@ -1797,6 +1801,107 @@ fn eventKey(allocator: std.mem.Allocator, event: []const u8, name: []const u8) !
 test "Rush extension registry exposes abbr as an extension" {
     const abbr = registry.lookup("abbr") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(builtin.Origin.extension, abbr.origin);
+}
+
+test "abbreviation names accept periods including .." {
+    try std.testing.expect(isAbbreviationName("gs"));
+    try std.testing.expect(isAbbreviationName("_private"));
+    try std.testing.expect(isAbbreviationName("a1"));
+    try std.testing.expect(isAbbreviationName("."));
+    try std.testing.expect(isAbbreviationName(".."));
+    try std.testing.expect(isAbbreviationName("..."));
+    try std.testing.expect(isAbbreviationName(".git"));
+    try std.testing.expect(isAbbreviationName("foo.bar"));
+    try std.testing.expect(isAbbreviationName("foo_bar"));
+
+    try std.testing.expect(!isAbbreviationName(""));
+    try std.testing.expect(!isAbbreviationName("1abc"));
+    try std.testing.expect(!isAbbreviationName("-gs"));
+    try std.testing.expect(!isAbbreviationName("g-s"));
+    try std.testing.expect(!isAbbreviationName("gs!"));
+    try std.testing.expect(!isAbbreviationName("g s"));
+}
+
+test "evalAbbr sets lists and erases period names" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    const TestHost = struct {
+        stdout: std.ArrayList(u8) = .empty,
+
+        // ziglint-ignore: Z020 Z030 test helper/reusable deinit; preserve behavior
+        fn deinit(self: *@This()) void {
+            self.stdout.deinit(std.testing.allocator);
+        }
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn writeAll(self: *@This(), fd: host.Fd, bytes: []const u8) !void {
+            switch (fd) {
+                .stdout => try self.stdout.appendSlice(std.testing.allocator, bytes),
+                else => {},
+            }
+        }
+    };
+
+    var test_host: TestHost = .{};
+    defer test_host.deinit();
+    const Shell = struct {
+        host: *TestHost,
+    };
+    var sh: Shell = .{ .host = &test_host };
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "..", "cd .." })).status,
+    );
+    try std.testing.expectEqualStrings("cd ..", state.getAbbreviation("..").?);
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "gs", "git status" })).status,
+    );
+    try std.testing.expectEqualStrings("git status", state.getAbbreviation("gs").?);
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 2),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "1bad", "nope" })).status,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), state.getAbbreviation("1bad"));
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 2),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "g-s", "nope" })).status,
+    );
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "--list" })).status,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, test_host.stdout.items, "abbr .. 'cd ..'\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, test_host.stdout.items, "abbr gs 'git status'\n") != null);
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "--erase", ".." })).status,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), state.getAbbreviation(".."));
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 1),
+        (try evalAbbr(&state, &sh, &.{ "abbr", "--erase", ".." })).status,
+    );
+}
+
+test "expandAbbreviation expands period names" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.putAbbreviation("..", "cd ..");
+
+    const edit = (try expandAbbreviation(&state, std.testing.allocator, "..", 2, true)).?;
+    defer std.testing.allocator.free(edit.replacement);
+    try std.testing.expectEqual(@as(usize, 0), edit.replace_start);
+    try std.testing.expectEqual(@as(usize, 2), edit.replace_end);
+    try std.testing.expectEqualStrings("cd ..", edit.replacement);
+    try std.testing.expect(edit.append_space);
 }
 
 test "Rush extension registry does not expose legacy prompt_async command" {
