@@ -906,7 +906,10 @@ pub const LineSession = struct {
     fn enterViCommandMode(self: *LineSession) void {
         self.vi_state = .command;
         self.resetViCommandPrefix();
-        if (self.editor.buffer.cursor_byte == self.editor.buffer.text().len) {
+        // Leaving insert/replace for command mode always steps onto the previous
+        // grapheme (classic vi). At column 0 the cursor stays put so `i`/`a` at
+        // the start of the line remain usable.
+        if (self.editor.buffer.cursor_byte != 0) {
             self.editor.buffer.moveLeft();
         }
         // ziglint-ignore: Z026 best-effort undo snapshot for mode transition
@@ -3781,6 +3784,42 @@ test "vi line session switches modes and edits in command mode" {
     try session.handleKey(.{ .key = .text, .text = "B" });
     try std.testing.expectEqualStrings("aBbc", session.editor.buffer.text());
 }
+
+test "vi leave-insert steps onto previous character" {
+    var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer session.deinit();
+
+    try session.handleKey(.{ .key = .text, .text = "abcd" });
+    try session.handleKey(.{ .key = .escape });
+    // After typing at EOL, ESC lands on the last character.
+    try std.testing.expectEqual(@as(usize, 3), session.editor.buffer.cursor_byte);
+
+    // i ESC does not change position when already on a character; a second
+    // i ESC steps left once more only when insert moved the cursor right.
+    // Bare i ESC i ESC from mid-line: each ESC steps left from the insert point.
+    try session.handleKey(.{ .key = .text, .text = "0" });
+    try session.handleKey(.{ .key = .text, .text = "l" });
+    try session.handleKey(.{ .key = .text, .text = "l" });
+    try std.testing.expectEqual(@as(usize, 2), session.editor.buffer.cursor_byte); // on 'c'
+    try session.handleKey(.{ .key = .text, .text = "i" });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expectEqual(@as(usize, 1), session.editor.buffer.cursor_byte); // on 'b'
+    try session.handleKey(.{ .key = .text, .text = "i" });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expectEqual(@as(usize, 0), session.editor.buffer.cursor_byte); // on 'a'
+
+    // a ESC a ESC leaves the cursor unmoved: append steps right, ESC steps left.
+    try session.handleKey(.{ .key = .text, .text = "l" });
+    try std.testing.expectEqual(@as(usize, 1), session.editor.buffer.cursor_byte);
+    try session.handleKey(.{ .key = .text, .text = "a" });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expectEqual(@as(usize, 1), session.editor.buffer.cursor_byte);
+    try session.handleKey(.{ .key = .text, .text = "a" });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expectEqual(@as(usize, 1), session.editor.buffer.cursor_byte);
+    try std.testing.expectEqualStrings("abcd", session.editor.buffer.text());
+}
+
 test "vi insert mode inserts newline on shift-enter and kills next word" {
     var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
     defer session.deinit();
@@ -3868,9 +3907,12 @@ test "vi line session repeats insert editing controls" {
     try counted.handleKey(.{ .key = .text, .text = "z" });
     try counted.handleKey(.{ .key = .escape });
     try std.testing.expectEqualStrings("xzxzab", counted.editor.buffer.text());
+    // ESC leaves the cursor on the last inserted character, so `.` replays at
+    // that column rather than after the insert.
+    try std.testing.expectEqual(@as(usize, 3), counted.editor.buffer.cursor_byte);
 
     try counted.handleKey(.{ .key = .text, .text = "." });
-    try std.testing.expectEqualStrings("xzxzxzxzab", counted.editor.buffer.text());
+    try std.testing.expectEqualStrings("xzxxzxzzab", counted.editor.buffer.text());
 
     var edited = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
     defer edited.deinit();
@@ -3884,9 +3926,11 @@ test "vi line session repeats insert editing controls" {
     try edited.handleKey(.{ .key = .text, .text = "three " });
     try edited.handleKey(.{ .key = .escape });
     try std.testing.expectEqualStrings("one three end", edited.editor.buffer.text());
+    // ESC steps onto the space before "end", so `.` replays from that column.
+    try std.testing.expectEqual(@as(usize, 9), edited.editor.buffer.cursor_byte);
 
     try edited.handleKey(.{ .key = .text, .text = "." });
-    try std.testing.expectEqualStrings("one three one three end", edited.editor.buffer.text());
+    try std.testing.expectEqualStrings("one threeone three  end", edited.editor.buffer.text());
 
     var moved = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
     defer moved.deinit();
@@ -3900,9 +3944,10 @@ test "vi line session repeats insert editing controls" {
     try moved.handleKey(.{ .key = .text, .text = "Z" });
     try moved.handleKey(.{ .key = .escape });
     try std.testing.expectEqualStrings("xZyab", moved.editor.buffer.text());
+    try std.testing.expectEqual(@as(usize, 1), moved.editor.buffer.cursor_byte);
 
     try moved.handleKey(.{ .key = .text, .text = "." });
-    try std.testing.expectEqualStrings("xZxZyyab", moved.editor.buffer.text());
+    try std.testing.expectEqualStrings("xxZyZyab", moved.editor.buffer.text());
 }
 
 test "vi line session repeats replace mode sessions" {
@@ -3916,9 +3961,11 @@ test "vi line session repeats replace mode sessions" {
     try session.handleKey(.{ .key = .text, .text = "XY" });
     try session.handleKey(.{ .key = .escape });
     try std.testing.expectEqualStrings("XYcdef", session.editor.buffer.text());
+    // ESC from replace lands on the last replaced character.
+    try std.testing.expectEqual(@as(usize, 1), session.editor.buffer.cursor_byte);
 
     try session.handleKey(.{ .key = .text, .text = "." });
-    try std.testing.expectEqualStrings("XYXYef", session.editor.buffer.text());
+    try std.testing.expectEqualStrings("XXYdef", session.editor.buffer.text());
 }
 
 test "vi line session multiplies operator and motion counts" {
