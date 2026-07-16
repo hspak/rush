@@ -439,7 +439,16 @@ pub fn viChangeWordMotionRange(
     count: usize,
     motion: ViMotionResult,
 ) ViMotionRange {
-    if (bytes.len == 0 or motion.cursor <= cursor_byte) return viMotionRange(bytes, cursor_byte, motion);
+    // `motion` is the w/W landing point from the operator path. Change-word does
+    // not use that exclusive next-word-start range; classic vi treats cw/cW on a
+    // non-blank like change-to-end-of-word so following whitespace is preserved.
+    // Unlike plain `e`, the first unit stays on the current word when the cursor
+    // is already on its last character (so `cw` on a single-letter word does not
+    // swallow the blank and next word).
+    _ = motion;
+    if (bytes.len == 0) return .{ .start = 0, .end = 0, .cursor_after_delete = 0 };
+    // On a blank with count 1, only change the whitespace under the cursor so a
+    // following run of blanks is not collapsed.
     if (count == 1 and cursor_byte < bytes.len and isAsciiWhitespace(bytes[cursor_byte])) {
         return .{
             .start = cursor_byte,
@@ -447,18 +456,44 @@ pub fn viChangeWordMotionRange(
             .cursor_after_delete = cursor_byte,
         };
     }
-    if (motion.cursor == lastGraphemeStart(bytes)) {
-        return .{ .start = cursor_byte, .end = bytes.len, .cursor_after_delete = cursor_byte };
-    }
+    const kind: ViWordKind = if (motion_command == 'W') .bigword else .word;
+    const end_cursor = changeViWordEndCount(bytes, cursor_byte, count, kind);
+    return viMotionRange(bytes, cursor_byte, .{ .cursor = end_cursor, .inclusive = true });
+}
 
-    var end = motion.cursor;
-    while (end > cursor_byte) {
-        const previous = previousCodepointStart(bytes, end);
-        if (!isAsciiWhitespace(bytes[previous])) break;
-        end = previous;
+/// End of the word under/after `cursor_byte` without advancing when already on
+/// the word's last character (the first unit of cw/cW).
+pub fn currentViWordEnd(bytes: []const u8, cursor_byte: usize, kind: ViWordKind) usize {
+    if (bytes.len == 0) return 0;
+    if (cursor_byte >= lastGraphemeStart(bytes)) return lastGraphemeStart(bytes);
+    var cursor = cursor_byte;
+    if (cursor < bytes.len and isAsciiWhitespace(bytes[cursor])) {
+        while (cursor < bytes.len and isAsciiWhitespace(bytes[cursor])) cursor = nextCodepointEnd(bytes, cursor);
+        if (cursor >= bytes.len) return lastGraphemeStart(bytes);
     }
-    if (end == cursor_byte and (motion_command == 'w' or motion_command == 'W')) end = motion.cursor;
-    return .{ .start = cursor_byte, .end = end, .cursor_after_delete = cursor_byte };
+    if (kind == .bigword) {
+        while (nextCodepointEnd(bytes, cursor) < bytes.len and
+            !isAsciiWhitespace(bytes[nextCodepointEnd(bytes, cursor)]))
+        {
+            cursor = nextCodepointEnd(bytes, cursor);
+        }
+    } else {
+        const class = viWordClass(bytes[cursor]);
+        while (nextCodepointEnd(bytes, cursor) < bytes.len and
+            !isAsciiWhitespace(bytes[nextCodepointEnd(bytes, cursor)]) and
+            viWordClass(bytes[nextCodepointEnd(bytes, cursor)]) == class)
+        {
+            cursor = nextCodepointEnd(bytes, cursor);
+        }
+    }
+    return cursor;
+}
+
+pub fn changeViWordEndCount(bytes: []const u8, cursor_byte: usize, count: usize, kind: ViWordKind) usize {
+    var cursor = currentViWordEnd(bytes, cursor_byte, kind);
+    var remaining = count - 1;
+    while (remaining != 0) : (remaining -= 1) cursor = nextViWordEnd(bytes, cursor, kind);
+    return cursor;
 }
 
 pub fn multiplyViCounts(a: usize, b: usize) usize {

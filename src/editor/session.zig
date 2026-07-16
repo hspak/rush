@@ -734,10 +734,11 @@ pub const LineSession = struct {
                 self.editor.buffer.cursor_byte,
             ) and !self.vi_replaying_repeat) try self.setViLastRepeat(.delete_to_end),
             'C' => {
-                _ = try self.viDeleteRange(
+                _ = try self.viDeleteRangeForState(
                     self.editor.buffer.cursor_byte,
                     self.editor.buffer.text().len,
                     self.editor.buffer.cursor_byte,
+                    .insert,
                 );
                 try self.beginViInsertRepeat(.change_to_end);
                 self.enterViInsertModeAtCursor();
@@ -1070,10 +1071,11 @@ pub const LineSession = struct {
                 self.editor.buffer.cursor_byte,
             ),
             .change_to_end => |input| {
-                _ = try self.viDeleteRange(
+                _ = try self.viDeleteRangeForState(
                     self.editor.buffer.cursor_byte,
                     self.editor.buffer.text().len,
                     self.editor.buffer.cursor_byte,
+                    .insert,
                 );
                 try self.applyViInputRepeat(input, .insert);
                 self.finishViInputRepeat(input);
@@ -1100,7 +1102,7 @@ pub const LineSession = struct {
                     operator.count,
                     motion,
                 );
-                if (!try self.viDeleteRange(range.start, range.end, range.cursor_after_delete)) return;
+                if (!try self.viDeleteRangeForState(range.start, range.end, range.cursor_after_delete, .insert)) return;
                 try self.applyViInputRepeat(operator.input, .insert);
                 self.finishViInputRepeat(operator.input);
             },
@@ -1208,7 +1210,10 @@ pub const LineSession = struct {
                     .count = count,
                 } }),
             .change => {
-                if (!try self.viDeleteRange(range.start, range.end, range.cursor_after_delete)) return;
+                // Change enters insert mode next, so keep the post-delete cursor at
+                // the insertion point even when that is one past the last character
+                // (for example, `cw` on the final word leaves following blanks intact).
+                if (!try self.viDeleteRangeForState(range.start, range.end, range.cursor_after_delete, .insert)) return;
                 try self.beginViInsertRepeat(.{ .operator_change = .{
                     .motion_command = motion_command,
                     .count = count,
@@ -1366,13 +1371,24 @@ pub const LineSession = struct {
     }
 
     fn viDeleteRange(self: *LineSession, start: usize, end: usize, cursor_after_delete: usize) !bool {
+        return self.viDeleteRangeForState(start, end, cursor_after_delete, self.vi_state);
+    }
+
+    fn viDeleteRangeForState(
+        self: *LineSession,
+        start: usize,
+        end: usize,
+        cursor_after_delete: usize,
+        state_after_delete: ViState,
+    ) !bool {
         if (start >= end) return false;
         try self.saveViUndo();
         self.kill_ring.clearRetainingCapacity();
         try self.kill_ring.appendSlice(self.allocator, self.editor.buffer.text()[start..end]);
         try self.editor.buffer.replaceRange(start, end, "");
         self.editor.buffer.cursor_byte = @min(cursor_after_delete, self.editor.buffer.text().len);
-        if (self.vi_state == .command and self.editor.buffer.cursor_byte == self.editor.buffer.text().len) {
+        // Command mode cannot rest on the one-past-end slot; insert/replace may.
+        if (state_after_delete == .command and self.editor.buffer.cursor_byte == self.editor.buffer.text().len) {
             self.editor.buffer.moveLeft();
         }
         self.completion_menu.clear(self.allocator);
@@ -3765,7 +3781,6 @@ test "vi line session switches modes and edits in command mode" {
     try session.handleKey(.{ .key = .text, .text = "B" });
     try std.testing.expectEqualStrings("aBbc", session.editor.buffer.text());
 }
-
 test "vi insert mode inserts newline on shift-enter and kills next word" {
     var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
     defer session.deinit();
@@ -3973,6 +3988,31 @@ test "vi line session repeats operator changes and preserves change-word blanks"
     try blank.handleKey(.{ .key = .text, .text = "X" });
     try blank.handleKey(.{ .key = .escape });
     try std.testing.expectEqualStrings("oneX two", blank.editor.buffer.text());
+
+    // When the next word is a single character at EOL, w lands on lastGraphemeStart.
+    // cw must still act like ce and preserve the blank before that word.
+    var short_last = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer short_last.deinit();
+    try short_last.handleKey(.{ .key = .text, .text = "a b" });
+    try short_last.handleKey(.{ .key = .escape });
+    try short_last.handleKey(.{ .key = .text, .text = "0" });
+    try short_last.handleKey(.{ .key = .text, .text = "c" });
+    try short_last.handleKey(.{ .key = .text, .text = "w" });
+    try short_last.handleKey(.{ .key = .text, .text = "X" });
+    try short_last.handleKey(.{ .key = .escape });
+    try std.testing.expectEqualStrings("X b", short_last.editor.buffer.text());
+
+    // cw on the final word should replace only that word.
+    var last_word = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer last_word.deinit();
+    try last_word.handleKey(.{ .key = .text, .text = "hello world" });
+    try last_word.handleKey(.{ .key = .escape });
+    try last_word.handleKey(.{ .key = .text, .text = "b" });
+    try last_word.handleKey(.{ .key = .text, .text = "c" });
+    try last_word.handleKey(.{ .key = .text, .text = "w" });
+    try last_word.handleKey(.{ .key = .text, .text = "X" });
+    try last_word.handleKey(.{ .key = .escape });
+    try std.testing.expectEqualStrings("hello X", last_word.editor.buffer.text());
 }
 
 test "vi line session leaves out-of-range operator motions unchanged" {
