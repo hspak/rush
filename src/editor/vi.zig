@@ -421,7 +421,8 @@ pub fn viOperatorMotionRange(
     motion: ViMotionResult,
 ) ViMotionRange {
     if (operator == .change and (motion_command == 'w' or motion_command == 'W')) {
-        return viChangeWordMotionRange(bytes, cursor_byte, motion_command, count, motion);
+        // Change-word ignores exclusive w/W: classic vi uses sticky end-of-word.
+        return viChangeWordMotionRange(bytes, cursor_byte, motion_command, count);
     }
     if ((motion_command == 'w' or motion_command == 'W') and
         motion.cursor == lastGraphemeStart(bytes) and
@@ -432,20 +433,14 @@ pub fn viOperatorMotionRange(
     return viMotionRange(bytes, cursor_byte, motion);
 }
 
+/// Range for `cw`/`cW`. Does not take a w/W motion: change-word is sticky
+/// end-of-word (like ce/cE for the first unit), not exclusive next-word-start.
 pub fn viChangeWordMotionRange(
     bytes: []const u8,
     cursor_byte: usize,
     motion_command: u21,
     count: usize,
-    motion: ViMotionResult,
 ) ViMotionRange {
-    // `motion` is the w/W landing point from the operator path. Change-word does
-    // not use that exclusive next-word-start range; classic vi treats cw/cW on a
-    // non-blank like change-to-end-of-word so following whitespace is preserved.
-    // Unlike plain `e`, the first unit stays on the current word when the cursor
-    // is already on its last character (so `cw` on a single-letter word does not
-    // swallow the blank and next word).
-    _ = motion;
     if (bytes.len == 0) return .{ .start = 0, .end = 0, .cursor_after_delete = 0 };
     // On a blank with count 1, only change the whitespace under the cursor so a
     // following run of blanks is not collapsed.
@@ -471,22 +466,7 @@ pub fn currentViWordEnd(bytes: []const u8, cursor_byte: usize, kind: ViWordKind)
         while (cursor < bytes.len and isAsciiWhitespace(bytes[cursor])) cursor = nextCodepointEnd(bytes, cursor);
         if (cursor >= bytes.len) return lastGraphemeStart(bytes);
     }
-    if (kind == .bigword) {
-        while (nextCodepointEnd(bytes, cursor) < bytes.len and
-            !isAsciiWhitespace(bytes[nextCodepointEnd(bytes, cursor)]))
-        {
-            cursor = nextCodepointEnd(bytes, cursor);
-        }
-    } else {
-        const class = viWordClass(bytes[cursor]);
-        while (nextCodepointEnd(bytes, cursor) < bytes.len and
-            !isAsciiWhitespace(bytes[nextCodepointEnd(bytes, cursor)]) and
-            viWordClass(bytes[nextCodepointEnd(bytes, cursor)]) == class)
-        {
-            cursor = nextCodepointEnd(bytes, cursor);
-        }
-    }
-    return cursor;
+    return scanToWordEnd(bytes, cursor, kind);
 }
 
 pub fn changeViWordEndCount(bytes: []const u8, cursor_byte: usize, count: usize, kind: ViWordKind) usize {
@@ -577,6 +557,12 @@ pub fn nextViWordEnd(bytes: []const u8, cursor_byte: usize, kind: ViWordKind) us
         while (cursor < bytes.len and isAsciiWhitespace(bytes[cursor])) cursor = nextCodepointEnd(bytes, cursor);
     }
     if (cursor >= bytes.len) return lastGraphemeStart(bytes);
+    return scanToWordEnd(bytes, cursor, kind);
+}
+
+/// Advance from a non-blank `cursor` to the last codepoint of its word/bigword.
+fn scanToWordEnd(bytes: []const u8, cursor_byte: usize, kind: ViWordKind) usize {
+    var cursor = cursor_byte;
     if (kind == .bigword) {
         while (nextCodepointEnd(bytes, cursor) < bytes.len and
             !isAsciiWhitespace(bytes[nextCodepointEnd(bytes, cursor)]))
@@ -714,4 +700,45 @@ pub fn isAsciiWhitespace(byte: u8) bool {
         ' ', '\t', '\n', '\r' => true,
         else => false,
     };
+}
+
+test "currentViWordEnd is sticky on last character of word" {
+    try std.testing.expectEqual(@as(usize, 0), currentViWordEnd("a b", 0, .word));
+    try std.testing.expectEqual(@as(usize, 2), currentViWordEnd("a b", 2, .word));
+    try std.testing.expectEqual(@as(usize, 4), currentViWordEnd("hello", 4, .word));
+    try std.testing.expectEqual(@as(usize, 4), currentViWordEnd("hello", 0, .word));
+    // Word class splits alnum and punctuation: "foo" then "." then "bar".
+    try std.testing.expectEqual(@as(usize, 2), currentViWordEnd("foo.bar", 0, .word));
+    try std.testing.expectEqual(@as(usize, 3), currentViWordEnd("foo.bar", 3, .word));
+    try std.testing.expectEqual(@as(usize, 6), currentViWordEnd("foo.bar", 4, .word));
+}
+
+test "changeViWordEndCount spans additional words for counts above one" {
+    try std.testing.expectEqual(@as(usize, 2), changeViWordEndCount("one two", 0, 1, .word));
+    try std.testing.expectEqual(@as(usize, 6), changeViWordEndCount("one two", 0, 2, .word));
+    // First unit sticky on 'a', second unit is end of 'b' (index 2).
+    try std.testing.expectEqual(@as(usize, 2), changeViWordEndCount("a b c", 0, 2, .word));
+    try std.testing.expectEqual(@as(usize, 4), changeViWordEndCount("a b c", 0, 3, .word));
+}
+
+test "viChangeWordMotionRange preserves blanks around the changed word" {
+    const mid = viChangeWordMotionRange("one two three", 0, 'w', 1);
+    try std.testing.expectEqual(@as(usize, 0), mid.start);
+    try std.testing.expectEqual(@as(usize, 3), mid.end);
+
+    const short_last = viChangeWordMotionRange("a b", 0, 'w', 1);
+    try std.testing.expectEqual(@as(usize, 0), short_last.start);
+    try std.testing.expectEqual(@as(usize, 1), short_last.end);
+
+    const final_word = viChangeWordMotionRange("hello world", 6, 'w', 1);
+    try std.testing.expectEqual(@as(usize, 6), final_word.start);
+    try std.testing.expectEqual(@as(usize, 11), final_word.end);
+
+    const on_blank = viChangeWordMotionRange("one  two", 3, 'w', 1);
+    try std.testing.expectEqual(@as(usize, 3), on_blank.start);
+    try std.testing.expectEqual(@as(usize, 4), on_blank.end);
+
+    const two_words = viChangeWordMotionRange("one two three", 0, 'w', 2);
+    try std.testing.expectEqual(@as(usize, 0), two_words.start);
+    try std.testing.expectEqual(@as(usize, 7), two_words.end);
 }

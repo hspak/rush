@@ -96,6 +96,7 @@ const viMacroKeyEvent = vi.viMacroKeyEvent;
 const viHistoryPatternMatches = vi.viHistoryPatternMatches;
 const viMotion = vi.viMotion;
 const viOperatorMotionRange = vi.viOperatorMotionRange;
+const viChangeWordMotionRange = vi.viChangeWordMotionRange;
 const multiplyViCounts = vi.multiplyViCounts;
 const firstNonBlank = vi.firstNonBlank;
 const previousViWordStart = vi.previousViWordStart;
@@ -734,11 +735,11 @@ pub const LineSession = struct {
                 self.editor.buffer.cursor_byte,
             ) and !self.vi_replaying_repeat) try self.setViLastRepeat(.delete_to_end),
             'C' => {
-                _ = try self.viDeleteRangeForState(
+                _ = try self.viDeleteRangeWithCursorPolicy(
                     self.editor.buffer.cursor_byte,
                     self.editor.buffer.text().len,
                     self.editor.buffer.cursor_byte,
-                    .insert,
+                    false,
                 );
                 try self.beginViInsertRepeat(.change_to_end);
                 self.enterViInsertModeAtCursor();
@@ -1074,11 +1075,11 @@ pub const LineSession = struct {
                 self.editor.buffer.cursor_byte,
             ),
             .change_to_end => |input| {
-                _ = try self.viDeleteRangeForState(
+                _ = try self.viDeleteRangeWithCursorPolicy(
                     self.editor.buffer.cursor_byte,
                     self.editor.buffer.text().len,
                     self.editor.buffer.cursor_byte,
-                    .insert,
+                    false,
                 );
                 try self.applyViInputRepeat(input, .insert);
                 self.finishViInputRepeat(input);
@@ -1091,21 +1092,13 @@ pub const LineSession = struct {
             },
             .operator_delete => |operator| try self.applyViOperator(.delete, operator.motion_command, operator.count),
             .operator_change => |operator| {
-                const motion = viMotion(
-                    self.editor.buffer.text(),
-                    self.editor.buffer.cursor_byte,
-                    operator.motion_command,
-                    operator.count,
-                ) orelse return;
-                const range = viOperatorMotionRange(
-                    self.editor.buffer.text(),
-                    self.editor.buffer.cursor_byte,
-                    .change,
-                    operator.motion_command,
-                    operator.count,
-                    motion,
-                );
-                if (!try self.viDeleteRangeForState(range.start, range.end, range.cursor_after_delete, .insert)) return;
+                const range = self.viOperatorRange(.change, operator.motion_command, operator.count) orelse return;
+                if (!try self.viDeleteRangeWithCursorPolicy(
+                    range.start,
+                    range.end,
+                    range.cursor_after_delete,
+                    false,
+                )) return;
                 try self.applyViInputRepeat(operator.input, .insert);
                 self.finishViInputRepeat(operator.input);
             },
@@ -1191,20 +1184,7 @@ pub const LineSession = struct {
             }
             return;
         }
-        const motion = viMotion(
-            self.editor.buffer.text(),
-            self.editor.buffer.cursor_byte,
-            motion_command,
-            count,
-        ) orelse return;
-        const range = viOperatorMotionRange(
-            self.editor.buffer.text(),
-            self.editor.buffer.cursor_byte,
-            operator,
-            motion_command,
-            count,
-            motion,
-        );
+        const range = self.viOperatorRange(operator, motion_command, count) orelse return;
         switch (operator) {
             .delete => if (try self.viDeleteRange(range.start, range.end, range.cursor_after_delete) and
                 !self.vi_replaying_repeat)
@@ -1213,10 +1193,14 @@ pub const LineSession = struct {
                     .count = count,
                 } }),
             .change => {
-                // Change enters insert mode next, so keep the post-delete cursor at
-                // the insertion point even when that is one past the last character
-                // (for example, `cw` on the final word leaves following blanks intact).
-                if (!try self.viDeleteRangeForState(range.start, range.end, range.cursor_after_delete, .insert)) return;
+                // Change enters insert next: do not clamp past EOL so the insertion
+                // point can sit after a preserved trailing blank (e.g. final-word cw).
+                if (!try self.viDeleteRangeWithCursorPolicy(
+                    range.start,
+                    range.end,
+                    range.cursor_after_delete,
+                    false,
+                )) return;
                 try self.beginViInsertRepeat(.{ .operator_change = .{
                     .motion_command = motion_command,
                     .count = count,
@@ -1225,6 +1209,37 @@ pub const LineSession = struct {
             },
             .yank => try self.viYankRange(range.start, range.end),
         }
+    }
+
+    /// Resolve an operator motion range. Change-word skips computing exclusive w/W.
+    fn viOperatorRange(
+        self: *LineSession,
+        operator: ViOperator,
+        motion_command: u21,
+        count: usize,
+    ) ?ViMotionRange {
+        if (operator == .change and (motion_command == 'w' or motion_command == 'W')) {
+            return viChangeWordMotionRange(
+                self.editor.buffer.text(),
+                self.editor.buffer.cursor_byte,
+                motion_command,
+                count,
+            );
+        }
+        const motion = viMotion(
+            self.editor.buffer.text(),
+            self.editor.buffer.cursor_byte,
+            motion_command,
+            count,
+        ) orelse return null;
+        return viOperatorMotionRange(
+            self.editor.buffer.text(),
+            self.editor.buffer.cursor_byte,
+            operator,
+            motion_command,
+            count,
+            motion,
+        );
     }
 
     fn applyViFind(self: *LineSession, find: ViFindCommand, count: usize) !void {
@@ -1373,16 +1388,21 @@ pub const LineSession = struct {
         return self.viDeleteRange(start, self.editor.buffer.cursor_byte, start);
     }
 
+    /// Delete `[start, end)` and clamp the cursor for command mode when it would
+    /// sit past the last character.
     fn viDeleteRange(self: *LineSession, start: usize, end: usize, cursor_after_delete: usize) !bool {
-        return self.viDeleteRangeForState(start, end, cursor_after_delete, self.vi_state);
+        return self.viDeleteRangeWithCursorPolicy(start, end, cursor_after_delete, true);
     }
 
-    fn viDeleteRangeForState(
+    /// Like `viDeleteRange`, but `clamp_to_command_cursor` controls whether a
+    /// post-delete end-of-line cursor is pulled left. Change operators pass
+    /// false because insert may legally sit at `len`.
+    fn viDeleteRangeWithCursorPolicy(
         self: *LineSession,
         start: usize,
         end: usize,
         cursor_after_delete: usize,
-        state_after_delete: ViState,
+        clamp_to_command_cursor: bool,
     ) !bool {
         if (start >= end) return false;
         try self.saveViUndo();
@@ -1390,8 +1410,7 @@ pub const LineSession = struct {
         try self.kill_ring.appendSlice(self.allocator, self.editor.buffer.text()[start..end]);
         try self.editor.buffer.replaceRange(start, end, "");
         self.editor.buffer.cursor_byte = @min(cursor_after_delete, self.editor.buffer.text().len);
-        // Command mode cannot rest on the one-past-end slot; insert/replace may.
-        if (state_after_delete == .command and self.editor.buffer.cursor_byte == self.editor.buffer.text().len) {
+        if (clamp_to_command_cursor and self.editor.buffer.cursor_byte == self.editor.buffer.text().len) {
             self.editor.buffer.moveLeft();
         }
         self.completion_menu.clear(self.allocator);
