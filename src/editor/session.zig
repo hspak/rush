@@ -3813,8 +3813,6 @@ test "vi leave-insert steps onto previous character" {
     // After typing at EOL, ESC lands on the last character.
     try std.testing.expectEqual(@as(usize, 3), session.editor.buffer.cursor_byte);
 
-    // i ESC does not change position when already on a character; a second
-    // i ESC steps left once more only when insert moved the cursor right.
     // Bare i ESC i ESC from mid-line: each ESC steps left from the insert point.
     try session.handleKey(.{ .key = .text, .text = "0" });
     try session.handleKey(.{ .key = .text, .text = "l" });
