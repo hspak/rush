@@ -348,11 +348,12 @@ fn giveTerminalToProcessGroup(shell: anytype, process_group: host_mod.Pid) !?hos
     };
     if (!@hasDecl(HostType, "terminalProcessGroup") or
         !@hasDecl(HostType, "setTerminalProcessGroup")) return null;
-    const shell_process_group = shell.host.terminalProcessGroup(.stdin) catch |err| switch (err) {
+    const tty_fd = shell.state.controlling_tty orelse .stdin;
+    const shell_process_group = shell.host.terminalProcessGroup(tty_fd) catch |err| switch (err) {
         error.NotATerminal => return null,
         else => return err,
     };
-    shell.host.setTerminalProcessGroup(.stdin, process_group) catch |err| switch (err) {
+    shell.host.setTerminalProcessGroup(tty_fd, process_group) catch |err| switch (err) {
         error.NotATerminal => return null,
         else => return err,
     };
@@ -366,7 +367,7 @@ fn restoreTerminalToProcessGroup(shell: anytype, process_group: host_mod.Pid) vo
     };
     if (!@hasDecl(HostType, "setTerminalProcessGroup")) return;
     // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
-    shell.host.setTerminalProcessGroup(.stdin, process_group) catch {};
+    shell.host.setTerminalProcessGroup(shell.state.controlling_tty orelse .stdin, process_group) catch {};
 }
 
 fn pipelineStatus(statuses: []const host_mod.WaitStatus, pipefail: bool) result.ExitStatus {

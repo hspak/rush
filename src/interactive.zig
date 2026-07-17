@@ -95,6 +95,7 @@ fn enableJobControl(sh: *RushShell, tty_fd: host.Fd) ?host.Pid {
 
     const shell_pid = sh.host.currentProcessId();
     sh.state.shell_pid = shell_pid;
+    sh.state.controlling_tty = null;
     ignoreInteractiveJobControlSignals(sh);
     sh.host.setProcessGroup(0, shell_pid) catch {
         sh.state.options.monitor = false;
@@ -122,6 +123,9 @@ fn enableJobControl(sh: *RushShell, tty_fd: host.Fd) ?host.Pid {
         sh.state.options.monitor = false;
         return null;
     }
+    // Use the same tty for later give/restore so fg does not hand off via a
+    // redirected stdin while the interactive session owns /dev/tty.
+    sh.state.controlling_tty = tty_fd;
     sh.state.options.monitor = true;
     return original_terminal_group;
 }
@@ -194,8 +198,9 @@ const InteractiveSession = struct {
 
     fn restoreTerminalProcessGroup(self: *InteractiveSession) void {
         if (self.restore_terminal_pgrp) |process_group| {
+            const tty_fd = self.sh.state.controlling_tty orelse .stdin;
             // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
-            self.sh.host.setTerminalProcessGroup(.stdin, process_group) catch {};
+            self.sh.host.setTerminalProcessGroup(tty_fd, process_group) catch {};
         }
     }
 

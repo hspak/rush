@@ -309,6 +309,15 @@ pub fn terminalProcessGroup(_: RealHost, fd: host.Fd) TerminalProcessGroupError!
 }
 
 pub fn setTerminalProcessGroup(_: RealHost, fd: host.Fd, process_group: host.Pid) TerminalProcessGroupError!void {
+    // Block SIGTTOU while claiming the terminal. Otherwise a shell that is not
+    // currently the foreground process group can be stopped mid-handoff when
+    // tcsetpgrp generates TTOU, leaving fg/bg and child jobs wedged.
+    var blocked = std.posix.sigemptyset();
+    std.posix.sigaddset(&blocked, .TTOU);
+    var previous: std.posix.sigset_t = undefined;
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &blocked, &previous);
+    defer std.posix.sigprocmask(std.posix.SIG.SETMASK, &previous, null);
+
     while (true) {
         const rc = tcsetpgrp(fd.raw(), @intCast(process_group));
         switch (std.c.errno(rc)) {

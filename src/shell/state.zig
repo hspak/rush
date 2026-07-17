@@ -306,6 +306,9 @@ pub const State = struct {
     running_exit_trap: bool = false,
     running_signal_trap: bool = false,
     shell_pid: ?host.Pid = null,
+    /// Controlling terminal used for job-control handoff. Prefer this over
+    /// stdin so fg/bg still work when the interactive editor owns /dev/tty.
+    controlling_tty: ?host.Fd = null,
     parent_pid: ?host.Pid = null,
     start_time_ns: i128 = 0,
     seconds_base_time_ns: i128 = 0,
