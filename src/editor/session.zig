@@ -532,7 +532,18 @@ pub const LineSession = struct {
                 self.completion_menu.clear(self.allocator);
                 self.requests.put(self.allocator, .clear_screen);
             },
-            .left, .right, .home, .end, .word_left, .word_right, .argument_left, .argument_right => {
+            .right, .end => {
+                // Same accept contract as emacs mode: only at EOL with a suggestion.
+                if (self.editor.buffer.cursor_byte == self.editor.buffer.text().len and
+                    try self.acceptAutosuggestion())
+                {
+                    return;
+                }
+                try self.editor.handleKey(event);
+                try self.appendViInputRepeatKey(event.key);
+                self.completion_menu.clear(self.allocator);
+            },
+            .left, .home, .word_left, .word_right, .argument_left, .argument_right => {
                 if (event.key == .argument_left) {
                     try self.movePreviousArgument();
                 } else if (event.key == .argument_right) {
@@ -3005,6 +3016,50 @@ test "line session undo restores accepted autosuggestions as one step" {
     try std.testing.expectEqualStrings("git", session.editor.buffer.text());
     try session.handleKey(.{ .key = .undo });
     try std.testing.expectEqualStrings("", session.editor.buffer.text());
+}
+
+test "vi insert mode accepts autosuggestion with right and end at eol" {
+    var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "" }, .{}, .vi);
+    defer session.deinit();
+    try std.testing.expectEqual(ViState.insert, session.vi_state);
+
+    try session.handleKey(.{ .key = .text, .text = "git" });
+    try session.applyAutosuggestionResult("git", .{
+        .id = 1,
+        .text = try std.testing.allocator.dupe(u8, "git status"),
+    });
+    try session.handleKey(.{ .key = .right });
+    try std.testing.expectEqualStrings("git status", session.editor.buffer.text());
+    try std.testing.expect(session.autosuggestion == null);
+
+    try session.handleKey(.{ .key = .undo });
+    try std.testing.expectEqualStrings("git", session.editor.buffer.text());
+    try session.applyAutosuggestionResult("git", .{
+        .id = 2,
+        .text = try std.testing.allocator.dupe(u8, "git status --short"),
+    });
+    try session.handleKey(.{ .key = .end });
+    try std.testing.expectEqualStrings("git status --short", session.editor.buffer.text());
+}
+
+test "vi insert mode right at mid-line does not accept autosuggestion" {
+    var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "" }, .{}, .vi);
+    defer session.deinit();
+
+    try session.handleKey(.{ .key = .text, .text = "git " });
+    try session.handleKey(.{ .key = .text, .text = "st" });
+    try session.applyAutosuggestionResult("git st", .{
+        .id = 1,
+        .text = try std.testing.allocator.dupe(u8, "git status"),
+    });
+    // Cursor mid-line: left twice from "git st"
+    try session.handleKey(.{ .key = .left });
+    try session.handleKey(.{ .key = .left });
+    try std.testing.expectEqual(@as(usize, "git ".len), session.editor.buffer.cursor_byte);
+    try session.handleKey(.{ .key = .right });
+    try std.testing.expectEqualStrings("git st", session.editor.buffer.text());
+    try std.testing.expect(session.autosuggestion != null);
+    try std.testing.expectEqual(@as(usize, "git s".len), session.editor.buffer.cursor_byte);
 }
 
 test "line session records clear screen requests" {
