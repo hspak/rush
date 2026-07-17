@@ -144,6 +144,11 @@ fn ignoreInteractiveJobControlSignals(sh: *RushShell) void {
     }
 }
 
+fn deinitTerminalAfterRestore(session: anytype, terminal: anytype) void {
+    session.restoreTerminalProcessGroup();
+    terminal.deinit();
+}
+
 const InteractiveSession = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -168,8 +173,7 @@ const InteractiveSession = struct {
         };
         defer self.clearHistoryCurrentDirectory();
         defer self.command_cache.deinit(self.allocator);
-        defer self.restoreTerminalProcessGroup();
-        defer terminal.deinit();
+        defer deinitTerminalAfterRestore(self, &terminal);
         self.terminal = &terminal;
         defer self.terminal = null;
         self.sh.setDirectoryChangeCallback(self, onDirectoryChange);
@@ -1518,6 +1522,38 @@ test "interactive input analysis styles reserved words operators options and exp
         try std.testing.expectEqual(want.severity, span.severity);
         try std.testing.expectEqualStrings(want.text, text[span.start..span.end]);
     }
+}
+
+test "interactive terminal teardown restores process group before closing tty" {
+    const Event = enum { restore, deinit };
+    const FakeSession = struct {
+        tty_closed: bool = false,
+        events: std.ArrayList(Event) = .empty,
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        fn restoreTerminalProcessGroup(self: *@This()) void {
+            std.testing.expect(!self.tty_closed) catch unreachable;
+            self.events.append(std.testing.allocator, .restore) catch unreachable;
+        }
+    };
+    const FakeTerminal = struct {
+        session: *FakeSession,
+
+        // ziglint-ignore: Z020 Z030 test-local helper uses @This(); avoid non-semantic refactor
+        fn deinit(self: *@This()) void {
+            self.session.tty_closed = true;
+            self.session.events.append(std.testing.allocator, .deinit) catch unreachable;
+        }
+    };
+
+    var session: FakeSession = .{};
+    defer session.events.deinit(std.testing.allocator);
+    var terminal: FakeTerminal = .{ .session = &session };
+
+    deinitTerminalAfterRestore(&session, &terminal);
+
+    try std.testing.expect(session.tty_closed);
+    try std.testing.expectEqualSlices(Event, &.{ .restore, .deinit }, session.events.items);
 }
 
 test {
