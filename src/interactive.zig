@@ -97,13 +97,18 @@ fn enableJobControl(sh: *RushShell, tty_fd: host.Fd) ?host.Pid {
     sh.state.shell_pid = shell_pid;
     sh.state.controlling_tty = null;
     ignoreInteractiveJobControlSignals(sh);
-    sh.host.setProcessGroup(0, shell_pid) catch {
-        sh.state.options.monitor = false;
-        return null;
-    };
+    // Login shells are usually already process-group leaders (and often session
+    // leaders). setpgid fails with EPERM for session leaders, so only create a
+    // new group when we are not already the intended leader.
+    if (original_process_group != shell_pid) {
+        sh.host.setProcessGroup(0, shell_pid) catch {
+            sh.state.options.monitor = false;
+            return null;
+        };
+    }
     sh.host.setTerminalProcessGroup(tty_fd, shell_pid) catch {
         // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
-        sh.host.setProcessGroup(0, original_process_group) catch {};
+        if (original_process_group != shell_pid) sh.host.setProcessGroup(0, original_process_group) catch {};
         sh.state.options.monitor = false;
         return null;
     };
@@ -111,7 +116,7 @@ fn enableJobControl(sh: *RushShell, tty_fd: host.Fd) ?host.Pid {
         // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
         sh.host.setTerminalProcessGroup(tty_fd, original_terminal_group) catch {};
         // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
-        sh.host.setProcessGroup(0, original_process_group) catch {};
+        if (original_process_group != shell_pid) sh.host.setProcessGroup(0, original_process_group) catch {};
         sh.state.options.monitor = false;
         return null;
     };
@@ -119,7 +124,7 @@ fn enableJobControl(sh: *RushShell, tty_fd: host.Fd) ?host.Pid {
         // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
         sh.host.setTerminalProcessGroup(tty_fd, original_terminal_group) catch {};
         // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
-        sh.host.setProcessGroup(0, original_process_group) catch {};
+        if (original_process_group != shell_pid) sh.host.setProcessGroup(0, original_process_group) catch {};
         sh.state.options.monitor = false;
         return null;
     }
