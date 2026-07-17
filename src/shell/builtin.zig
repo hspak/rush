@@ -2200,6 +2200,7 @@ const SetOption = enum {
     emacs,
     errexit,
     hashall,
+    monitor,
     noclobber,
     noexec,
     noglob,
@@ -2216,6 +2217,7 @@ const set_option_names = std.StaticStringMap(SetOption).initComptime(.{
     .{ "emacs", .emacs },
     .{ "errexit", .errexit },
     .{ "hashall", .hashall },
+    .{ "monitor", .monitor },
     .{ "noclobber", .noclobber },
     .{ "noexec", .noexec },
     .{ "noglob", .noglob },
@@ -2232,6 +2234,7 @@ const set_option_order = [_]SetOption{
     .emacs,
     .errexit,
     .hashall,
+    .monitor,
     .noclobber,
     .noexec,
     .noglob,
@@ -2249,6 +2252,7 @@ fn setOptionName(option: SetOption) []const u8 {
         .emacs => "emacs",
         .errexit => "errexit",
         .hashall => "hashall",
+        .monitor => "monitor",
         .noclobber => "noclobber",
         .noexec => "noexec",
         .noglob => "noglob",
@@ -2267,6 +2271,7 @@ fn setOptionEnabled(shell: anytype, option: SetOption) bool {
         .emacs => shell.state.options.emacs,
         .errexit => shell.state.options.errexit,
         .hashall => shell.state.options.hashall,
+        .monitor => shell.state.options.monitor,
         .noclobber => shell.state.options.noclobber,
         .noexec => shell.state.options.noexec,
         .noglob => shell.state.options.noglob,
@@ -2283,19 +2288,20 @@ fn listSetOptions(shell: anytype, table: bool) !result.EvalResult {
     for (set_option_order) |option| {
         const name = setOptionName(option);
         const enabled = setOptionEnabled(shell, option);
-        if (table) {
-            try shell.host.writeAll(.stdout, try std.fmt.allocPrint(
+        const text = if (table)
+            try std.fmt.allocPrint(
                 shell.scratchAllocator(),
                 "{s}\t{s}\n",
                 .{ name, if (enabled) "on" else "off" },
-            ));
-        } else {
-            try shell.host.writeAll(.stdout, try std.fmt.allocPrint(
+            )
+        else
+            try std.fmt.allocPrint(
                 shell.scratchAllocator(),
                 "set {s}o {s}\n",
                 .{ if (enabled) "-" else "+", name },
-            ));
-        }
+            );
+        defer shell.scratchAllocator().free(text);
+        try shell.host.writeAll(.stdout, text);
     }
     return .{};
 }
@@ -2313,6 +2319,7 @@ fn setNamedOption(shell: anytype, name: []const u8, enabled: bool) bool {
         },
         .errexit => shell.state.options.errexit = enabled,
         .hashall => shell.state.options.hashall = enabled,
+        .monitor => shell.state.options.monitor = enabled,
         .noclobber => shell.state.options.noclobber = enabled,
         .noexec => shell.state.options.noexec = enabled,
         .noglob => shell.state.options.noglob = enabled,
@@ -3129,6 +3136,85 @@ test "set -o notify toggles notify option" {
         (try eval(&shell, set_definition, &.{ "set", "+o", "notify" })).status,
     );
     try std.testing.expect(!shell.state.options.notify);
+}
+
+test "set -o monitor toggles and lists the monitor option" {
+    const TestHost = struct {
+        stdout: std.ArrayList(u8) = .empty,
+
+        // ziglint-ignore: Z020 Z030 test helper/reusable deinit; preserve behavior
+        fn deinit(self: *@This()) void {
+            self.stdout.deinit(std.testing.allocator);
+        }
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn writeAll(self: *@This(), fd: host.Fd, bytes: []const u8) !void {
+            switch (fd) {
+                .stdout => try self.stdout.appendSlice(std.testing.allocator, bytes),
+                else => {},
+            }
+        }
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn setFileCreationMask(_: *@This(), mask: u32) u32 {
+            return mask;
+        }
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn currentProcessId(_: *@This()) host.Pid {
+            return 1;
+        }
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn sendSignal(_: *@This(), _: host.Pid, _: u8) !void {}
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn setSignalDefault(_: *@This(), _: u8) !void {}
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn setSignalIgnored(_: *@This(), _: u8) !void {}
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        pub fn installSignalTrap(_: *@This(), _: u8) !void {}
+    };
+    const TestShell = struct {
+        host: TestHost = .{},
+        state: state_mod.State,
+
+        // ziglint-ignore: Z020 test-local helper uses @This(); avoid non-semantic refactor
+        fn scratchAllocator(_: *@This()) std.mem.Allocator {
+            return std.testing.allocator;
+        }
+    };
+
+    var shell: TestShell = .{ .state = state_mod.State.init(std.testing.allocator, .{}) };
+    defer shell.state.deinit();
+    defer shell.host.deinit();
+    const set_definition = lookup("set").?;
+
+    try std.testing.expect(!shell.state.options.monitor);
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try eval(&shell, set_definition, &.{ "set", "-o", "monitor" })).status,
+    );
+    try std.testing.expect(shell.state.options.monitor);
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try eval(&shell, set_definition, &.{ "set", "-o" })).status,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, shell.host.stdout.items, "monitor\ton\n") != null);
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try eval(&shell, set_definition, &.{ "set", "+o", "monitor" })).status,
+    );
+    try std.testing.expect(!shell.state.options.monitor);
+    shell.host.stdout.clearRetainingCapacity();
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try eval(&shell, set_definition, &.{ "set", "-o" })).status,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, shell.host.stdout.items, "monitor\toff\n") != null);
 }
 
 test "set -o vi and emacs are mutually exclusive editing options" {
