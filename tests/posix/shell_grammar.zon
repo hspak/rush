@@ -560,9 +560,9 @@
         .{
             .name = "unalias takes effect for later complete commands",
             .script =
-            \\alias greet='printf aliased\n'
-            \\unalias greet
-            \\greet
+            \\alias no_such_posix_command_for_rush='printf aliased\n'
+            \\unalias no_such_posix_command_for_rush
+            \\no_such_posix_command_for_rush
             ,
             .stdout = "",
             .stderr_match = .nonempty,
