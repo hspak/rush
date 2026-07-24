@@ -368,17 +368,14 @@ pub const LineSession = struct {
         switch (event.key) {
             .enter => {
                 if (event.modifiers.shift) return self.insertLiteralNewline();
-                if (self.completion_menu.selectedCandidate()) |candidate| {
-                    try self.applyCompletionCandidate(candidate);
-                    return;
-                }
+                if (try self.acceptSelectedCompletionCandidate()) return;
                 self.completion_menu.clear(self.allocator);
                 std.debug.assert(self.submitted_line == null);
                 self.submitted_line = try self.allocator.dupe(u8, self.editor.buffer.text());
                 self.state = .submitted;
             },
             .escape => {
-                self.completion_menu.clear(self.allocator);
+                _ = self.handleOpenCompletionMenuKey(event);
             },
             .ctrl_c => {
                 try self.clearInput();
@@ -460,14 +457,9 @@ pub const LineSession = struct {
                 try self.editor.handleKey(event);
                 self.completion_menu.clear(self.allocator);
             },
-            .up => if (self.completion_menu.isOpen())
-                self.completion_menu.selectPrevious()
-            else
-                try self.historyPrevious(),
-            .down => if (self.completion_menu.isOpen()) self.completion_menu.selectNext() else try self.historyNext(),
-            .tab => if (self.completion_menu.isOpen()) {
-                if (event.modifiers.shift) self.completion_menu.selectPrevious() else self.completion_menu.selectNext();
-            },
+            .up => if (!self.handleOpenCompletionMenuKey(event)) try self.historyPrevious(),
+            .down => if (!self.handleOpenCompletionMenuKey(event)) try self.historyNext(),
+            .tab => _ = self.handleOpenCompletionMenuKey(event),
             else => {
                 try self.editor.handleKey(event);
                 if (!self.completion_menu.isOpen()) self.completion_menu.clear(self.allocator);
@@ -486,6 +478,7 @@ pub const LineSession = struct {
     fn handleViInsertKey(self: *LineSession, event: KeyEvent) !void {
         switch (event.key) {
             .escape => {
+                if (self.handleOpenCompletionMenuKey(event)) return;
                 try self.finishViInsertRepeat();
                 self.enterViCommandMode();
             },
@@ -500,9 +493,16 @@ pub const LineSession = struct {
                     try self.insertLiteralNewline();
                     return self.appendViInputRepeatText("\n");
                 }
+                if (try self.acceptSelectedCompletionCandidate()) {
+                    self.clearViInsertRepeatCapture();
+                    return;
+                }
                 self.clearViInsertRepeatCapture();
                 try self.submitInput();
             },
+            .tab => _ = self.handleOpenCompletionMenuKey(event),
+            .up => if (!self.handleOpenCompletionMenuKey(event)) try self.historyPrevious(),
+            .down => if (!self.handleOpenCompletionMenuKey(event)) try self.historyNext(),
             .backspace => {
                 self.editor.buffer.deletePrevious();
                 try self.appendViInputRepeatKey(.backspace);
@@ -1994,6 +1994,37 @@ pub const LineSession = struct {
 
     pub fn hasCompletionMenu(self: LineSession) bool {
         return self.completion_menu.isOpen();
+    }
+
+    // Keep menu navigation identical across emacs and vi insert so mode-specific
+    // key handlers cannot drift (e.g. Tab cycling only working in one mode).
+    fn handleOpenCompletionMenuKey(self: *LineSession, event: KeyEvent) bool {
+        if (!self.completion_menu.isOpen()) return false;
+        switch (event.key) {
+            .tab => {
+                if (event.modifiers.shift) self.completion_menu.selectPrevious() else self.completion_menu.selectNext();
+                return true;
+            },
+            .up => {
+                self.completion_menu.selectPrevious();
+                return true;
+            },
+            .down => {
+                self.completion_menu.selectNext();
+                return true;
+            },
+            .escape => {
+                self.completion_menu.clear(self.allocator);
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn acceptSelectedCompletionCandidate(self: *LineSession) !bool {
+        const candidate = self.completion_menu.selectedCandidate() orelse return false;
+        try self.applyCompletionCandidate(candidate);
+        return true;
     }
 
     pub fn hasCompletionFlash(self: LineSession) bool {
@@ -3513,6 +3544,44 @@ test "completion menu moves selection with tab and shift tab" {
     try std.testing.expectEqualStrings("git ", session.editor.buffer.text());
     try session.handleKey(.{ .key = .enter });
     try std.testing.expectEqualStrings("git status ", session.editor.buffer.text());
+}
+
+test "vi insert completion menu moves selection with tab and shift tab" {
+    var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer session.deinit();
+    try session.editor.buffer.replace("git ");
+    var candidates = [_]completion.Candidate{
+        .{ .value = "status", .kind = .subcommand, .replace_start = 4, .replace_end = 4 },
+        .{ .value = "switch", .kind = .subcommand, .replace_start = 4, .replace_end = 4 },
+        .{ .value = "stash", .kind = .subcommand, .replace_start = 4, .replace_end = 4 },
+    };
+
+    try session.applyCompletion(.{ .ambiguous = &candidates });
+    try std.testing.expect(session.hasCompletionMenu());
+    try std.testing.expect(session.completion_menu.selectedCandidate() == null);
+    try std.testing.expectEqual(ViState.insert, session.vi_state);
+
+    try session.handleKey(.{ .key = .tab });
+    try std.testing.expectEqual(@as(usize, 0), session.completion_menu.selected);
+    try session.handleKey(.{ .key = .tab });
+    try std.testing.expectEqual(@as(usize, 1), session.completion_menu.selected);
+    try session.handleKey(.{ .key = .tab, .modifiers = .{ .shift = true } });
+    try std.testing.expectEqual(@as(usize, 0), session.completion_menu.selected);
+    try session.handleKey(.{ .key = .down });
+    try std.testing.expectEqual(@as(usize, 1), session.completion_menu.selected);
+    try session.handleKey(.{ .key = .up });
+    try std.testing.expectEqual(@as(usize, 0), session.completion_menu.selected);
+
+    try std.testing.expectEqualStrings("git ", session.editor.buffer.text());
+    try session.handleKey(.{ .key = .enter });
+    try std.testing.expectEqualStrings("git status ", session.editor.buffer.text());
+    try std.testing.expect(!session.hasCompletionMenu());
+    try std.testing.expectEqual(ViState.insert, session.vi_state);
+
+    try session.applyCompletion(.{ .ambiguous = &candidates });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expect(!session.hasCompletionMenu());
+    try std.testing.expectEqual(ViState.insert, session.vi_state);
 }
 
 test "completion menu remains open across text edits and modifier-only events" {
