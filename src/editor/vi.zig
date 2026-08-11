@@ -105,11 +105,20 @@ pub const ViInputRepeatMode = enum {
 pub const ViInputRepeatOp = union(enum) {
     text: []u8,
     key: Key,
+    completion: struct {
+        replace_before_cursor: usize,
+        replace_after_cursor: usize,
+        replacement: []u8,
+        append_space: bool,
+    },
+    remove_before_cursor: usize,
 
     pub fn deinit(self: ViInputRepeatOp, allocator: std.mem.Allocator) void {
         switch (self) {
             .text => |text| allocator.free(text),
             .key => {},
+            .completion => |edit| allocator.free(edit.replacement),
+            .remove_before_cursor => {},
         }
     }
 
@@ -125,6 +134,8 @@ pub const ViInputRepeatOp = union(enum) {
                 => true,
                 else => false,
             },
+            .completion => true,
+            .remove_before_cursor => |byte_count| byte_count != 0,
         };
     }
 };

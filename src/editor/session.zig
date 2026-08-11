@@ -493,16 +493,12 @@ pub const LineSession = struct {
                     try self.insertLiteralNewline();
                     return self.appendViInputRepeatText("\n");
                 }
-                if (try self.acceptSelectedCompletionCandidate()) {
-                    self.clearViInsertRepeatCapture();
-                    return;
-                }
+                if (try self.acceptSelectedCompletionCandidate()) return;
                 self.clearViInsertRepeatCapture();
                 try self.submitInput();
             },
             .tab => _ = self.handleOpenCompletionMenuKey(event),
-            .up => if (!self.handleOpenCompletionMenuKey(event)) try self.historyPrevious(),
-            .down => if (!self.handleOpenCompletionMenuKey(event)) try self.historyNext(),
+            .up, .down => _ = self.handleOpenCompletionMenuKey(event),
             .backspace => {
                 self.editor.buffer.deletePrevious();
                 try self.appendViInputRepeatKey(.backspace);
@@ -583,6 +579,7 @@ pub const LineSession = struct {
     fn handleViReplaceKey(self: *LineSession, event: KeyEvent) !void {
         switch (event.key) {
             .escape => {
+                if (self.handleOpenCompletionMenuKey(event)) return;
                 try self.finishViInsertRepeat();
                 self.enterViCommandMode();
             },
@@ -597,6 +594,7 @@ pub const LineSession = struct {
                     try self.insertLiteralNewline();
                     return self.appendViInputRepeatText("\n");
                 }
+                if (try self.acceptSelectedCompletionCandidate()) return;
                 self.clearViInsertRepeatCapture();
                 try self.submitInput();
             },
@@ -987,6 +985,32 @@ pub const LineSession = struct {
         try self.vi_insert_repeat_ops.append(self.allocator, .{ .key = key });
     }
 
+    fn appendViInputRepeatRemoval(self: *LineSession, byte_count: usize) !void {
+        if (self.vi_insert_repeat == null or self.vi_replaying_repeat or byte_count == 0) return;
+        try self.vi_insert_repeat_ops.append(self.allocator, .{ .remove_before_cursor = byte_count });
+    }
+
+    fn appendViInputRepeatCompletion(
+        self: *LineSession,
+        replace_start: usize,
+        replace_end: usize,
+        cursor_before: usize,
+        replacement: []const u8,
+        append_space: bool,
+    ) !void {
+        if (self.vi_insert_repeat == null or self.vi_replaying_repeat) return;
+        std.debug.assert(replace_start <= cursor_before);
+        std.debug.assert(cursor_before <= replace_end);
+        const copy = try self.allocator.dupe(u8, replacement);
+        errdefer self.allocator.free(copy);
+        try self.vi_insert_repeat_ops.append(self.allocator, .{ .completion = .{
+            .replace_before_cursor = cursor_before - replace_start,
+            .replace_after_cursor = replace_end - cursor_before,
+            .replacement = copy,
+            .append_space = append_space,
+        } });
+    }
+
     fn finishViInsertRepeat(self: *LineSession) !void {
         const capture = self.vi_insert_repeat orelse return;
         self.vi_insert_repeat = null;
@@ -1150,6 +1174,34 @@ pub const LineSession = struct {
                     .replace => try self.viReplaceInputText(text),
                 },
                 .key => |key| try self.applyViInputRepeatKey(key),
+                .completion => |edit| {
+                    const cursor = self.editor.buffer.cursor_byte;
+                    if (edit.replace_before_cursor > cursor or
+                        edit.replace_after_cursor > self.editor.buffer.text().len - cursor)
+                    {
+                        return;
+                    }
+                    const replace_start = cursor - edit.replace_before_cursor;
+                    const replace_end = cursor + edit.replace_after_cursor;
+                    if (!std.unicode.utf8ValidateSlice(self.editor.buffer.text()[0..replace_start]) or
+                        !std.unicode.utf8ValidateSlice(self.editor.buffer.text()[0..replace_end]))
+                    {
+                        return;
+                    }
+                    try self.editor.buffer.applyCompletionEdit(.{
+                        .replace_start = replace_start,
+                        .replace_end = replace_end,
+                        .replacement = edit.replacement,
+                        .append_space = edit.append_space,
+                    });
+                },
+                .remove_before_cursor => |byte_count| {
+                    const cursor = self.editor.buffer.cursor_byte;
+                    if (byte_count > cursor) return;
+                    const start = cursor - byte_count;
+                    if (!std.unicode.utf8ValidateSlice(self.editor.buffer.text()[0..start])) return;
+                    try self.editor.buffer.replaceRange(start, cursor, "");
+                },
             }
         }
         self.completion_menu.clear(self.allocator);
@@ -2609,7 +2661,9 @@ pub const LineSession = struct {
             .append_space = candidate.append_space,
         };
         const before = try self.snapshotBuffer();
-        errdefer before.deinit(self.allocator);
+        var before_owned = true;
+        errdefer if (before_owned) before.deinit(self.allocator);
+        const cursor_before = self.editor.buffer.cursor_byte;
         try self.editor.buffer.applyCompletionEdit(.{
             .replace_start = candidate.replace_start,
             .replace_end = candidate.replace_end,
@@ -2619,6 +2673,14 @@ pub const LineSession = struct {
             .append_space = candidate.append_space,
         });
         try self.commitUndo(before, .edit);
+        before_owned = false;
+        try self.appendViInputRepeatCompletion(
+            candidate.replace_start,
+            candidate.replace_end,
+            cursor_before,
+            replacement,
+            candidate.append_space,
+        );
         try self.setPendingRemovableSuffix(edit);
         self.completion_menu.clear(self.allocator);
     }
@@ -2678,6 +2740,7 @@ pub const LineSession = struct {
         const pending = self.pending_removable_suffix orelse return;
         const start = pending.start;
         const end = pending.end;
+        try self.appendViInputRepeatRemoval(end - start);
         self.clearPendingRemovableSuffix();
         try self.editor.buffer.replaceRange(start, end, "");
     }
@@ -3582,6 +3645,55 @@ test "vi insert completion menu moves selection with tab and shift tab" {
     try session.handleKey(.{ .key = .escape });
     try std.testing.expect(!session.hasCompletionMenu());
     try std.testing.expectEqual(ViState.insert, session.vi_state);
+
+    try session.handleKey(.{ .key = .escape });
+    try session.handleKey(.{ .key = .text, .text = "A" });
+    try session.handleKey(.{ .key = .text, .text = "st" });
+    const replace_start = session.editor.buffer.cursor_byte - 2;
+    const replace_end = session.editor.buffer.cursor_byte;
+    var repeat_candidates = [_]completion.Candidate{
+        .{ .value = "status", .kind = .subcommand, .replace_start = replace_start, .replace_end = replace_end },
+    };
+    try session.applyCompletion(.{ .ambiguous = &repeat_candidates });
+    try session.handleKey(.{ .key = .tab });
+    try session.handleKey(.{ .key = .enter });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expectEqualStrings("git status status ", session.editor.buffer.text());
+
+    try session.handleKey(.{ .key = .text, .text = "." });
+    try std.testing.expectEqualStrings("git status status status ", session.editor.buffer.text());
+}
+
+test "vi repeat preserves removable completion suffix handling" {
+    var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer session.deinit();
+    try session.editor.buffer.replace("base");
+
+    try session.handleKey(.{ .key = .escape });
+    try session.handleKey(.{ .key = .text, .text = "A" });
+    try session.handleKey(.{ .key = .text, .text = "sr" });
+    const replace_start = session.editor.buffer.cursor_byte - 2;
+    const replace_end = session.editor.buffer.cursor_byte;
+    var candidates = [_]completion.Candidate{
+        .{
+            .value = "src",
+            .suffix = "/",
+            .removable_suffix = true,
+            .append_space = false,
+            .kind = .directory,
+            .replace_start = replace_start,
+            .replace_end = replace_end,
+        },
+    };
+    try session.applyCompletion(.{ .ambiguous = &candidates });
+    try session.handleKey(.{ .key = .tab });
+    try session.handleKey(.{ .key = .enter });
+    try session.handleKey(.{ .key = .text, .text = " " });
+    try session.handleKey(.{ .key = .escape });
+    try std.testing.expectEqualStrings("basesrc ", session.editor.buffer.text());
+
+    try session.handleKey(.{ .key = .text, .text = "." });
+    try std.testing.expectEqualStrings("basesrc src ", session.editor.buffer.text());
 }
 
 test "completion menu remains open across text edits and modifier-only events" {
