@@ -62,9 +62,23 @@ Common build options:
 - `-fsys=sqlite3` links against system SQLite instead of the bundled
   amalgamation.
 - `-Dtarget=...` cross-compiles.
+- `-Dtarget=wasm32-freestanding` builds the embeddable wasm module instead of
+  the native executable.
 
 The install includes `rush(1)` for command usage and `rush(5)` for interactive
 configuration and prompts. Run `man rush` or `man 5 rush` after installation.
+
+## WebAssembly
+
+```sh
+zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
+```
+
+This installs `zig-out/bin/rush.wasm`, a no-entry module for embedders. It runs
+the shell language and builtins. External commands return 127; pipelines,
+subshells, and job control are unavailable.
+
+See `src/wasm.zig` for the C ABI, pointer lifetimes, and EXIT-trap rules.
 
 ## Run
 

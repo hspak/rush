@@ -19,6 +19,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const version = versionString(b);
+    const build_config = b.addOptions();
+    build_config.addOption([]const u8, "version", version);
+
+    if (target.result.cpu.arch.isWasm()) {
+        addWasmArtifact(b, target, optimize, build_config);
+        return;
+    }
+
+    build_config.addOption([]const u8, "sysconfdir", b.option(
+        []const u8,
+        "sysconfdir",
+        "Directory for system-wide configuration (default: <prefix>/etc)",
+    ) orelse b.getInstallPath(.prefix, "etc"));
+    build_config.addOption([]const u8, "datadir", b.option(
+        []const u8,
+        "datadir",
+        "Directory for read-only data files (default: <prefix>/share)",
+    ) orelse b.getInstallPath(.prefix, "share"));
+
     const uucode = sharedUucodeModule(b, target, optimize);
     const vaxis = sharedVaxisModule(b, target, optimize, uucode);
     const zeit = b.dependency("zeit", .{
@@ -31,25 +50,6 @@ pub fn build(b: *std.Build) void {
         "register-shell",
         "Register the installed executable in /etc/shells (default: true)",
     ) orelse true;
-
-    // System config dir, GNU sysconfdir convention: defaults to <prefix>/etc
-    // so non-root installs stay self-contained; packagers pass -Dsysconfdir=/etc.
-    const sysconfdir = b.option(
-        []const u8,
-        "sysconfdir",
-        "Directory for system-wide configuration (default: <prefix>/etc)",
-    ) orelse
-        b.getInstallPath(.prefix, "etc");
-    const datadir = b.option(
-        []const u8,
-        "datadir",
-        "Directory for read-only data files (default: <prefix>/share)",
-    ) orelse
-        b.getInstallPath(.prefix, "share");
-    const build_config = b.addOptions();
-    build_config.addOption([]const u8, "sysconfdir", sysconfdir);
-    build_config.addOption([]const u8, "datadir", datadir);
-    build_config.addOption([]const u8, "version", version);
 
     const exe_module = createRushRootModule(
         b,
@@ -161,8 +161,9 @@ pub fn build(b: *std.Build) void {
     const differential_step = b.step("differential", "Run generated differential shell integration tests");
     addDifferentialTests(b, target, optimize, exe, differential_step);
 
-    const compile_check_step = b.step("compile-check", "Compile-check Linux/macOS/BSD targets");
+    const compile_check_step = b.step("compile-check", "Compile-check Linux/macOS/BSD/wasm targets");
     addCompileChecks(b, compile_check_step, optimize, build_config, use_system_sqlite);
+    addWasmCompileCheck(b, compile_check_step, optimize, build_config);
 
     const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
     const lint_step = b.step("lint", "Run ziglint");
@@ -177,6 +178,58 @@ pub fn build(b: *std.Build) void {
 const RushRootModuleOptions = struct {
     link_libc: bool = false,
 };
+
+fn addWasmArtifact(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_config: *std.Build.Step.Options,
+) void {
+    const wasm = createWasmExecutable(b, target, optimize, build_config);
+    const install = b.addInstallArtifact(wasm, .{});
+    b.getInstallStep().dependOn(&install.step);
+}
+
+fn addWasmCompileCheck(
+    b: *std.Build,
+    compile_check_step: *std.Build.Step,
+    optimize: std.builtin.OptimizeMode,
+    build_config: *std.Build.Step.Options,
+) void {
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wasm = createWasmExecutable(b, wasm_target, optimize, build_config);
+    compile_check_step.dependOn(&wasm.step);
+}
+
+fn createWasmExecutable(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_config: *std.Build.Step.Options,
+) *std.Build.Step.Compile {
+    const uucode = sharedUucodeModule(b, target, optimize);
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "uucode", .module = uucode },
+        },
+    });
+    root_module.addOptions("build_config", build_config);
+
+    const wasm = b.addExecutable(.{
+        .name = "rush",
+        .root_module = root_module,
+    });
+    wasm.rdynamic = true;
+    wasm.export_table = true;
+    wasm.entry = .disabled;
+    return wasm;
+}
 
 fn addCompileChecks(
     b: *std.Build,

@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 
 const completion = @import("completion.zig");
 const prompt_markers = @import("../prompt_markers.zig");
+const ui_style = @import("../shell/ui_style.zig");
 
 const default_max_candidate_rows = 16;
 const default_max_label_width = 32;
@@ -372,86 +373,35 @@ fn appendTruncated(
 }
 
 pub fn appendUiStyleStart(allocator: std.mem.Allocator, out: *std.ArrayList(u8), style: UiStyle) !void {
-    if (style.bold) try out.appendSlice(allocator, "\x1b[1m");
-    if (style.dim) try out.appendSlice(allocator, "\x1b[2m");
-    if (style.italic) try out.appendSlice(allocator, "\x1b[3m");
-    switch (style.ul) {
-        .none => {},
-        .single => try out.appendSlice(allocator, "\x1b[4m"),
-        .double => try out.appendSlice(allocator, "\x1b[4:2m"),
-        .curly => try out.appendSlice(allocator, "\x1b[4:3m"),
-        .dotted => try out.appendSlice(allocator, "\x1b[4:4m"),
-        .dashed => try out.appendSlice(allocator, "\x1b[4:5m"),
-    }
-    if (style.reverse) try out.appendSlice(allocator, "\x1b[7m");
-    if (style.strike) try out.appendSlice(allocator, "\x1b[9m");
-    if (style.fg) |color| try appendAnsiColor(allocator, out, .fg, color);
-    if (style.bg) |color| try appendAnsiColor(allocator, out, .bg, color);
-    if (style.ul_color) |color| try appendAnsiColor(allocator, out, .ul, color);
+    try ui_style.appendUiStyleStart(allocator, out, ansiStyle(style));
 }
 
 pub fn appendUiStyleEnd(allocator: std.mem.Allocator, out: *std.ArrayList(u8), style: UiStyle) !void {
-    if (style.strike) try out.appendSlice(allocator, "\x1b[29m");
-    if (style.reverse) try out.appendSlice(allocator, "\x1b[27m");
-    if (style.ul != .none or style.ul_color != null) try out.appendSlice(allocator, "\x1b[24;59m");
-    if (style.italic) try out.appendSlice(allocator, "\x1b[23m");
-    if (style.bold or style.dim) try out.appendSlice(allocator, "\x1b[22m");
-    if (style.bg != null) try out.appendSlice(allocator, "\x1b[49m");
-    if (style.fg != null) try out.appendSlice(allocator, "\x1b[39m");
+    try ui_style.appendUiStyleEnd(allocator, out, ansiStyle(style));
 }
 
-fn appendAnsiColor(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    kind: enum { fg, bg, ul },
-    color: vaxis.Color,
-) !void {
-    switch (color) {
-        .default => switch (kind) {
-            .fg => try out.appendSlice(allocator, "\x1b[39m"),
-            .bg => try out.appendSlice(allocator, "\x1b[49m"),
-            .ul => try out.appendSlice(allocator, "\x1b[59m"),
+fn ansiStyle(style: UiStyle) ui_style.UiStyle {
+    return .{
+        .fg = if (style.fg) |color| ansiColor(color) else null,
+        .bg = if (style.bg) |color| ansiColor(color) else null,
+        .ul = switch (style.ul) {
+            inline else => |tag| @field(ui_style.UnderlineStyle, @tagName(tag)),
         },
-        .index => |index| {
-            if (kind != .ul and index < 16) {
-                const base: u8 = switch (kind) {
-                    .fg => if (index < 8) 30 else 90,
-                    .bg => if (index < 8) 40 else 100,
-                    .ul => unreachable,
-                };
-                const sequence = try std.fmt.allocPrint(allocator, "\x1b[{d}m", .{base + index % 8});
-                defer allocator.free(sequence);
-                try out.appendSlice(allocator, sequence);
-                return;
-            }
-            const prefix = switch (kind) {
-                .fg => "38",
-                .bg => "48",
-                .ul => "58",
-            };
-            const sequence = try std.fmt.allocPrint(
-                allocator,
-                "\x1b[{s}:5:{d}m",
-                .{ prefix, index },
-            );
-            defer allocator.free(sequence);
-            try out.appendSlice(allocator, sequence);
-        },
-        .rgb => |rgb| {
-            const prefix = switch (kind) {
-                .fg => "38",
-                .bg => "48",
-                .ul => "58",
-            };
-            const sequence = try std.fmt.allocPrint(
-                allocator,
-                "\x1b[{s}:2:{d}:{d}:{d}m",
-                .{ prefix, rgb[0], rgb[1], rgb[2] },
-            );
-            defer allocator.free(sequence);
-            try out.appendSlice(allocator, sequence);
-        },
-    }
+        .ul_color = if (style.ul_color) |color| ansiColor(color) else null,
+        .bold = style.bold,
+        .dim = style.dim,
+        .italic = style.italic,
+        .reverse = style.reverse,
+        .strike = style.strike,
+    };
+}
+
+fn ansiColor(color: vaxis.Color) ui_style.Color {
+    return switch (color) {
+        .default => .default,
+        .index => |index| .{ .index = index },
+        .rgb => |rgb| .{ .rgb = rgb },
+    };
 }
 
 pub fn visibleWidth(bytes: []const u8, method: vaxis.gwidth.Method) u16 {
@@ -591,16 +541,16 @@ test "basic colors use simple SGR and extended colors use subparameters" {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(std.testing.allocator);
 
-    try appendAnsiColor(std.testing.allocator, &output, .fg, .{ .index = 1 });
-    try appendAnsiColor(std.testing.allocator, &output, .bg, .{ .index = 2 });
-    try appendAnsiColor(std.testing.allocator, &output, .fg, .{ .index = 9 });
-    try appendAnsiColor(std.testing.allocator, &output, .bg, .{ .index = 10 });
-    try appendAnsiColor(std.testing.allocator, &output, .fg, .{ .index = 16 });
-    try appendAnsiColor(std.testing.allocator, &output, .bg, .{ .index = 17 });
-    try appendAnsiColor(std.testing.allocator, &output, .ul, .{ .index = 3 });
-    try appendAnsiColor(std.testing.allocator, &output, .fg, .{ .rgb = .{ 1, 2, 3 } });
-    try appendAnsiColor(std.testing.allocator, &output, .bg, .{ .rgb = .{ 4, 5, 6 } });
-    try appendAnsiColor(std.testing.allocator, &output, .ul, .{ .rgb = .{ 7, 8, 9 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .fg = .{ .index = 1 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .bg = .{ .index = 2 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .fg = .{ .index = 9 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .bg = .{ .index = 10 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .fg = .{ .index = 16 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .bg = .{ .index = 17 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .ul_color = .{ .index = 3 } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .fg = .{ .rgb = .{ 1, 2, 3 } } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .bg = .{ .rgb = .{ 4, 5, 6 } } });
+    try appendUiStyleStart(std.testing.allocator, &output, .{ .ul_color = .{ .rgb = .{ 7, 8, 9 } } });
 
     try std.testing.expectEqualStrings(
         "\x1b[31m\x1b[42m\x1b[91m\x1b[102m" ++

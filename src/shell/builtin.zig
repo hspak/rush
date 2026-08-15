@@ -1,9 +1,10 @@
 //! Builtin command dispatch for the direct evaluator.
 
 const std = @import("std");
+const zig_builtin = @import("builtin");
 
 const host = @import("../host.zig");
-const history_mod = @import("../history.zig");
+const history_mod = @import("command_history.zig");
 const builtin_history = @import("builtin_history.zig");
 const output = @import("output.zig");
 const printf = @import("printf.zig");
@@ -2116,6 +2117,12 @@ fn signalName(signal: []const u8) ?[]const u8 {
 }
 
 pub fn signalNumber(signal: []const u8) ?u8 {
+    if (comptime zig_builtin.cpu.arch.isWasm()) {
+        inline for (linux_signal_numbers) |entry| {
+            if (std.mem.eql(u8, signal, entry.name)) return entry.number;
+        }
+        return null;
+    }
     inline for (trap_signal_names) |name| {
         if (std.mem.eql(u8, signal, name) and @hasField(std.c.SIG, name)) {
             return @intCast(@intFromEnum(@field(std.c.SIG, name)));
@@ -2123,6 +2130,38 @@ pub fn signalNumber(signal: []const u8) ?u8 {
     }
     return null;
 }
+
+const linux_signal_numbers = [_]struct { name: []const u8, number: u8 }{
+    .{ .name = "HUP", .number = 1 },
+    .{ .name = "INT", .number = 2 },
+    .{ .name = "QUIT", .number = 3 },
+    .{ .name = "ILL", .number = 4 },
+    .{ .name = "TRAP", .number = 5 },
+    .{ .name = "ABRT", .number = 6 },
+    .{ .name = "BUS", .number = 7 },
+    .{ .name = "FPE", .number = 8 },
+    .{ .name = "KILL", .number = 9 },
+    .{ .name = "USR1", .number = 10 },
+    .{ .name = "SEGV", .number = 11 },
+    .{ .name = "USR2", .number = 12 },
+    .{ .name = "PIPE", .number = 13 },
+    .{ .name = "ALRM", .number = 14 },
+    .{ .name = "TERM", .number = 15 },
+    .{ .name = "CHLD", .number = 17 },
+    .{ .name = "CONT", .number = 18 },
+    .{ .name = "STOP", .number = 19 },
+    .{ .name = "TSTP", .number = 20 },
+    .{ .name = "TTIN", .number = 21 },
+    .{ .name = "TTOU", .number = 22 },
+    .{ .name = "URG", .number = 23 },
+    .{ .name = "XCPU", .number = 24 },
+    .{ .name = "XFSZ", .number = 25 },
+    .{ .name = "VTALRM", .number = 26 },
+    .{ .name = "PROF", .number = 27 },
+    .{ .name = "WINCH", .number = 28 },
+    .{ .name = "POLL", .number = 29 },
+    .{ .name = "SYS", .number = 31 },
+};
 
 fn signalNameFromNumber(number: u8) ?[]const u8 {
     for (trap_signal_names) |name| if (signalNumber(name) == number) return name;

@@ -5,7 +5,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const builtin = @import("builtin.zig");
 const eval = @import("eval.zig");
-const history = @import("../history.zig");
+const command_history_mod = @import("command_history.zig");
 const host_mod = @import("../host.zig");
 const lexer = @import("lexer.zig");
 const memory = @import("memory.zig");
@@ -35,7 +35,7 @@ pub fn ShellWithBuiltins(comptime Host: type, comptime builtin_registry: builtin
         state: state.State,
         extensions: builtin_registry.ExtensionState,
         arenas: memory.Arenas,
-        command_history: ?history.CommandHistory = null,
+        command_history: ?command_history_mod.CommandHistory = null,
         function_autoload: ?*const fn (*Self, []const u8) anyerror!bool = null,
         autoloading_function: ?[]const u8 = null,
         directory_change_context: ?*anyopaque = null,
@@ -109,8 +109,8 @@ pub fn ShellWithBuiltins(comptime Host: type, comptime builtin_registry: builtin
             self.function_autoload = autoload;
         }
 
-        pub fn setCommandHistory(self: *Self, command_history: history.CommandHistory) void {
-            self.command_history = command_history;
+        pub fn setCommandHistory(self: *Self, history: command_history_mod.CommandHistory) void {
+            self.command_history = history;
         }
 
         pub fn setDirectoryChangeCallback(

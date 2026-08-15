@@ -6,7 +6,7 @@
 const std = @import("std");
 
 const host = @import("../host.zig");
-const history_mod = @import("../history.zig");
+const history_mod = @import("command_history.zig");
 const result = @import("result.zig");
 
 pub fn evalFc(shell: anytype, args: []const []const u8) !result.EvalResult {

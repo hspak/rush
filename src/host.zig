@@ -1,8 +1,16 @@
 //! Host effects boundary for the rewritten shell.
 
 const std = @import("std");
+const zig_builtin = @import("builtin");
 
-pub const RealHost = @import("host/RealHost.zig");
+pub const RealHost = if (!zig_builtin.cpu.arch.isWasm())
+    // ziglint-ignore: Z028 RealHost is omitted on wasm so posix is not analyzed
+    @import("host/RealHost.zig")
+else
+    struct {};
+
+pub const WasmHost = @import("host/WasmHost.zig");
+pub const WasmSession = @import("host/WasmSession.zig");
 
 pub const Fd = enum(i32) {
     stdin = 0,
@@ -278,3 +286,8 @@ pub const WaitStatus = union(enum) {
         };
     }
 };
+
+test {
+    _ = WasmHost;
+    _ = WasmSession;
+}

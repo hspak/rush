@@ -6,9 +6,9 @@ const zig_builtin = @import("builtin");
 const ast = @import("ast.zig");
 const ast_copy = @import("ast_copy.zig");
 const builtin = @import("builtin.zig");
-const editor_render = @import("../editor/render.zig");
-const history_mod = @import("../history.zig");
+const command_history_mod = @import("command_history.zig");
 const host_mod = @import("../host.zig");
+const ui_style = @import("ui_style.zig");
 const lexer = @import("lexer.zig");
 const pattern_mod = @import("pattern.zig");
 const parser = @import("parser.zig");
@@ -2151,9 +2151,9 @@ fn writeCdFailureDiagnostic(
         if (mode == .line) try message.appendSlice(allocator, "; ");
         try message.appendSlice(allocator, "did you mean: ");
         const style = cdSuggestionDirectoryStyle(shell);
-        try editor_render.appendUiStyleStart(allocator, &message, style);
+        try ui_style.appendUiStyleStart(allocator, &message, style);
         try message.appendSlice(allocator, path);
-        try editor_render.appendUiStyleEnd(allocator, &message, style);
+        try ui_style.appendUiStyleEnd(allocator, &message, style);
         try message.append(allocator, '?');
     }
     switch (mode) {
@@ -2180,10 +2180,10 @@ fn readCdConfirmationKey(shell: anytype) ?u8 {
     return shell.host.readInteractiveKey(cd_suggestion_confirm_timeout_ms);
 }
 
-fn cdSuggestionDirectoryStyle(shell: anytype) editor_render.UiStyle {
-    var style = (editor_render.UiTheme{}).directory;
+fn cdSuggestionDirectoryStyle(shell: anytype) ui_style.UiStyle {
+    var style = (ui_style.UiTheme{}).directory;
     if (shell.state.getVariable("rush_style_directory")) |variable| {
-        style = editor_render.parseUiStyle(variable.value) orelse style;
+        style = ui_style.parseUiStyle(variable.value) orelse style;
     }
     style.bold = true;
     return style;
@@ -8801,8 +8801,8 @@ test "z builtin jumps through directory history" {
             _: *anyopaque,
             // ziglint-ignore: Z023 parameter order follows CommandHistory.list callback shape
             allocator: std.mem.Allocator,
-        ) ![]history_mod.HistoryEntry {
-            return allocator.alloc(history_mod.HistoryEntry, 0);
+        ) ![]command_history_mod.HistoryEntry {
+            return allocator.alloc(command_history_mod.HistoryEntry, 0);
         }
 
         fn jump(
@@ -8827,7 +8827,7 @@ test "z builtin jumps through directory history" {
         host: TestHost,
         state: state_mod.State,
         env: []const [*:0]const u8 = &.{},
-        command_history: ?history_mod.CommandHistory = null,
+        command_history: ?command_history_mod.CommandHistory = null,
         scratch: std.mem.Allocator,
         notified_old: []const u8 = "",
         notified_new: []const u8 = "",

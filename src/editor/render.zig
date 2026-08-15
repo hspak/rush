@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const completion = @import("completion.zig");
 const menu = @import("menu.zig");
 const prompt_markers = @import("../prompt_markers.zig");
+const ui_style = @import("../shell/ui_style.zig");
 
 pub const UnderlineStyle = menu.UnderlineStyle;
 pub const UiStyle = menu.UiStyle;
@@ -23,72 +24,32 @@ pub const CursorShape = enum {
 };
 
 pub fn parseUiStyle(text: []const u8) ?UiStyle {
-    var style: UiStyle = .{};
-    var iter = std.mem.splitScalar(u8, text, ',');
-    while (iter.next()) |raw_part| {
-        const part = std.mem.trim(u8, raw_part, " \t\r\n");
-        if (part.len == 0) continue;
-        if (std.mem.eql(u8, part, "bold")) {
-            style.bold = true;
-        } else if (std.mem.eql(u8, part, "dim")) {
-            style.dim = true;
-        } else if (std.mem.eql(u8, part, "italic")) {
-            style.italic = true;
-        } else if (std.mem.eql(u8, part, "reverse")) {
-            style.reverse = true;
-        } else if (std.mem.eql(u8, part, "strike")) {
-            style.strike = true;
-        } else if (std.mem.startsWith(u8, part, "fg=")) {
-            style.fg = parseUiColor(part["fg=".len..]) orelse return null;
-        } else if (std.mem.startsWith(u8, part, "bg=")) {
-            style.bg = parseUiColor(part["bg=".len..]) orelse return null;
-        } else if (std.mem.startsWith(u8, part, "ul_color=")) {
-            style.ul_color = parseUiColor(part["ul_color=".len..]) orelse return null;
-        } else if (std.mem.startsWith(u8, part, "ul=")) {
-            style.ul = parseUiUnderline(part["ul=".len..]) orelse return null;
-        } else return null;
-    }
-    return style;
-}
-
-fn parseUiUnderline(name: []const u8) ?UnderlineStyle {
-    if (std.mem.eql(u8, name, "none")) return .none;
-    if (std.mem.eql(u8, name, "single")) return .single;
-    if (std.mem.eql(u8, name, "double")) return .double;
-    if (std.mem.eql(u8, name, "curly")) return .curly;
-    if (std.mem.eql(u8, name, "dotted")) return .dotted;
-    if (std.mem.eql(u8, name, "dashed")) return .dashed;
-    return null;
+    const parsed = ui_style.parseUiStyle(text) orelse return null;
+    return .{
+        .fg = if (parsed.fg) |color| vaxisColor(color) else null,
+        .bg = if (parsed.bg) |color| vaxisColor(color) else null,
+        .ul = switch (parsed.ul) {
+            inline else => |tag| @field(UnderlineStyle, @tagName(tag)),
+        },
+        .ul_color = if (parsed.ul_color) |color| vaxisColor(color) else null,
+        .bold = parsed.bold,
+        .dim = parsed.dim,
+        .italic = parsed.italic,
+        .reverse = parsed.reverse,
+        .strike = parsed.strike,
+    };
 }
 
 pub fn parseUiColor(name: []const u8) ?vaxis.Color {
-    if (std.mem.eql(u8, name, "default")) return .default;
-    if (std.mem.eql(u8, name, "black")) return .{ .index = 0 };
-    if (std.mem.eql(u8, name, "red")) return .{ .index = 1 };
-    if (std.mem.eql(u8, name, "green")) return .{ .index = 2 };
-    if (std.mem.eql(u8, name, "yellow")) return .{ .index = 3 };
-    if (std.mem.eql(u8, name, "blue")) return .{ .index = 4 };
-    if (std.mem.eql(u8, name, "magenta")) return .{ .index = 5 };
-    if (std.mem.eql(u8, name, "cyan")) return .{ .index = 6 };
-    if (std.mem.eql(u8, name, "white")) return .{ .index = 7 };
-    if (std.mem.eql(u8, name, "bright-black")) return .{ .index = 8 };
-    if (std.mem.eql(u8, name, "bright-red")) return .{ .index = 9 };
-    if (std.mem.eql(u8, name, "bright-green")) return .{ .index = 10 };
-    if (std.mem.eql(u8, name, "bright-yellow")) return .{ .index = 11 };
-    if (std.mem.eql(u8, name, "bright-blue")) return .{ .index = 12 };
-    if (std.mem.eql(u8, name, "bright-magenta")) return .{ .index = 13 };
-    if (std.mem.eql(u8, name, "bright-cyan")) return .{ .index = 14 };
-    if (std.mem.eql(u8, name, "bright-white")) return .{ .index = 15 };
-    if (std.mem.startsWith(u8, name, "index:")) {
-        return .{ .index = std.fmt.parseUnsigned(u8, name["index:".len..], 10) catch return null };
-    }
-    if (name.len != 0 and std.ascii.isDigit(name[0])) {
-        return .{ .index = std.fmt.parseUnsigned(u8, name, 10) catch return null };
-    }
-    if (name.len == 7 and name[0] == '#') {
-        return vaxis.Color.rgbFromUint(std.fmt.parseUnsigned(u24, name[1..], 16) catch return null);
-    }
-    return null;
+    return vaxisColor(ui_style.parseUiColor(name) orelse return null);
+}
+
+fn vaxisColor(color: ui_style.Color) vaxis.Color {
+    return switch (color) {
+        .default => .default,
+        .index => |index| .{ .index = index },
+        .rgb => |rgb| .{ .rgb = rgb },
+    };
 }
 
 pub const Prompt = struct {
