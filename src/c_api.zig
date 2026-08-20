@@ -1,9 +1,10 @@
-//! Freestanding WebAssembly entry for embedders.
+//! C ABI for librush and the wasm embed module.
 //!
-//! Build with `zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall`.
-//! The artifact is `zig-out/bin/rush.wasm`: an executable with no start
-//! function. Instantiate it with no imports; `memory` and the `rush_*`
-//! exports are enough.
+//! Native `zig build` installs static and platform shared libraries under
+//! `zig-out/lib`, plus `zig-out/include/rush.h`. Wasm builds
+//! (`-Dtarget=wasm32-freestanding`)
+//! install `zig-out/bin/rush.wasm`: a no-entry module. Instantiate it with
+//! no imports; `memory` and the `rush_*` exports are enough.
 //!
 //! The module evaluates the shell language and builtins in-process. External
 //! commands return 127. Pipes, subshells, and job control fail with status 2
@@ -20,6 +21,7 @@
 //!   for the call.
 //! - `rush_stdout_*` / `rush_stderr_*` point into instance memory and are
 //!   invalidated by the next eval or by destroy.
+//! - An instance must not be accessed concurrently.
 //! - `rush_wasm_alloc_u8_array` / `rush_wasm_free_u8_array` must be paired
 //!   with the same length.
 //! - EXIT-trap output from `rush_destroy` is discarded with the instance; eval
@@ -72,7 +74,8 @@ fn create() callconv(.c) ?*WasmSession {
     return instance;
 }
 
-fn destroy(instance: *WasmSession) callconv(.c) void {
+fn destroy(maybe_instance: ?*WasmSession) callconv(.c) void {
+    const instance = maybe_instance orelse return;
     _ = instance.finish();
     instance.deinit();
     allocator.destroy(instance);
@@ -82,28 +85,30 @@ fn eval(instance: *WasmSession, ptr: [*]const u8, len: usize) callconv(.c) u8 {
     return instance.evalScript(ptr[0..len]);
 }
 
-fn stdoutPtr(instance: *WasmSession) callconv(.c) [*]const u8 {
+fn stdoutPtr(instance: *const WasmSession) callconv(.c) [*]const u8 {
     return instance.shell.host.stdoutPtr();
 }
 
-fn stdoutLen(instance: *WasmSession) callconv(.c) usize {
+fn stdoutLen(instance: *const WasmSession) callconv(.c) usize {
     return instance.shell.host.stdoutSlice().len;
 }
 
-fn stderrPtr(instance: *WasmSession) callconv(.c) [*]const u8 {
+fn stderrPtr(instance: *const WasmSession) callconv(.c) [*]const u8 {
     return instance.shell.host.stderrPtr();
 }
 
-fn stderrLen(instance: *WasmSession) callconv(.c) usize {
+fn stderrLen(instance: *const WasmSession) callconv(.c) usize {
     return instance.shell.host.stderrSlice().len;
 }
 
 fn allocU8Array(len: usize) callconv(.c) ?[*]u8 {
+    if (len == 0) return null;
     const bytes = allocator.alloc(u8, len) catch return null;
     return bytes.ptr;
 }
 
-fn freeU8Array(ptr: [*]u8, len: usize) callconv(.c) void {
+fn freeU8Array(maybe_ptr: ?[*]u8, len: usize) callconv(.c) void {
+    const ptr = maybe_ptr orelse return;
     allocator.free(ptr[0..len]);
 }
 

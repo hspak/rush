@@ -63,10 +63,28 @@ Common build options:
   amalgamation.
 - `-Dtarget=...` cross-compiles.
 - `-Dtarget=wasm32-freestanding` builds the embeddable wasm module instead of
-  the native executable.
+  the native executable and `librush`.
+- `-Dlto=none|thin|full` sets link-time optimization. The default is `none`.
 
 The install includes `rush(1)` for command usage and `rush(5)` for interactive
 configuration and prompts. Run `man rush` or `man 5 rush` after installation.
+
+## Library
+
+`zig build` also installs `librush`, the embeddable shell:
+
+```text
+zig-out/lib/librush.a
+zig-out/lib/librush.so (or librush.dylib on macOS)
+zig-out/include/rush.h
+```
+
+Use `zig build lib` to build only those artifacts. The library runs the shell
+language and builtins in-process. External commands return 127; pipelines,
+subshells, and job control are unavailable.
+
+See `include/rush.h` and `src/c_api.zig` for the C ABI, pointer lifetimes, and
+EXIT-trap rules.
 
 ## WebAssembly
 
@@ -74,11 +92,9 @@ configuration and prompts. Run `man rush` or `man 5 rush` after installation.
 zig build -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
 ```
 
-This installs `zig-out/bin/rush.wasm`, a no-entry module for embedders. It runs
-the shell language and builtins. External commands return 127; pipelines,
-subshells, and job control are unavailable.
-
-See `src/wasm.zig` for the C ABI, pointer lifetimes, and EXIT-trap rules.
+This installs `zig-out/bin/rush.wasm`, a no-entry module with the same C ABI as
+`librush`. Instantiate it with no imports; `memory` and the `rush_*` exports
+are enough.
 
 ## Run
 

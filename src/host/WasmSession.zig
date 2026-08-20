@@ -59,6 +59,7 @@ fn runExitOnce(self: *WasmSession, status: u8) u8 {
     if (self.finished) return self.exit_status;
     self.finished = true;
     const final_status = shell_mod.eval.runExitTrap(&self.shell, status) catch {
+        self.exit_status = 2;
         return self.reportEvalError(error.Unexpected);
     };
     self.exit_status = final_status;
@@ -106,5 +107,15 @@ test "persistent session reports unavailable pipelines" {
     defer session.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), session.evalScript("echo a | echo b"));
+    try std.testing.expectEqualStrings("rush: shell error\n", session.shell.host.stderrSlice());
+}
+
+test "persistent session retains an EXIT trap failure status" {
+    var session = try WasmSession.init(std.testing.allocator);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), session.evalScript("trap 'echo a | echo b' EXIT; exit 7"));
+    try std.testing.expectEqualStrings("rush: shell error\n", session.shell.host.stderrSlice());
+    try std.testing.expectEqual(@as(u8, 2), session.evalScript("echo still"));
     try std.testing.expectEqualStrings("rush: shell error\n", session.shell.host.stderrSlice());
 }

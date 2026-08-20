@@ -18,12 +18,17 @@ const release_version: std.SemanticVersion = .{ .major = 0, .minor = 1, .patch =
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const lto = b.option(
+        std.zig.LtoMode,
+        "lto",
+        "Link-time optimization (none, thin, full; default: none)",
+    ) orelse .none;
     const version = versionString(b);
     const build_config = b.addOptions();
     build_config.addOption([]const u8, "version", version);
 
     if (target.result.cpu.arch.isWasm()) {
-        addWasmArtifact(b, target, optimize, build_config);
+        addWasmArtifact(b, target, optimize, build_config, lto);
         return;
     }
 
@@ -60,17 +65,21 @@ pub fn build(b: *std.Build) void {
         zeit,
         build_config,
         use_system_sqlite,
-        .{ .link_libc = true },
+        .{ .link_libc = true, .lto = lto },
     );
+    const exe_version = std.SemanticVersion.parse(version) catch unreachable;
     const exe = b.addExecutable(.{
         .name = "rush",
         .root_module = exe_module,
-        .version = std.SemanticVersion.parse(version) catch unreachable,
+        .version = exe_version,
     });
     exe.stack_size = rush_stack_size;
+    applyLto(exe, lto);
 
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
+
+    const libs = addNativeLibraries(b, target, optimize, build_config, exe_version, lto);
     const register_shell = b.addSystemCommand(&.{
         "sh",
         "-c",
@@ -154,6 +163,7 @@ pub fn build(b: *std.Build) void {
     } else {
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
+    addLibAbiTests(b, target, optimize, libs.static, test_step, test_no_run);
 
     const conformance_step = b.step("conformance", "Run shell conformance tests");
     addConformanceTests(b, target, optimize, exe, conformance_step);
@@ -162,8 +172,8 @@ pub fn build(b: *std.Build) void {
     addDifferentialTests(b, target, optimize, exe, differential_step);
 
     const compile_check_step = b.step("compile-check", "Compile-check Linux/macOS/BSD/wasm targets");
-    addCompileChecks(b, compile_check_step, optimize, build_config, use_system_sqlite);
-    addWasmCompileCheck(b, compile_check_step, optimize, build_config);
+    addCompileChecks(b, compile_check_step, optimize, build_config, use_system_sqlite, exe_version, lto);
+    addWasmCompileCheck(b, compile_check_step, optimize, build_config, lto);
 
     const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
     const lint_step = b.step("lint", "Run ziglint");
@@ -177,6 +187,7 @@ pub fn build(b: *std.Build) void {
 
 const RushRootModuleOptions = struct {
     link_libc: bool = false,
+    lto: std.zig.LtoMode = .none,
 };
 
 fn addWasmArtifact(
@@ -184,8 +195,9 @@ fn addWasmArtifact(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     build_config: *std.Build.Step.Options,
+    lto: std.zig.LtoMode,
 ) void {
-    const wasm = createWasmExecutable(b, target, optimize, build_config);
+    const wasm = createWasmExecutable(b, target, optimize, build_config, lto);
     const install = b.addInstallArtifact(wasm, .{});
     b.getInstallStep().dependOn(&install.step);
 }
@@ -195,13 +207,34 @@ fn addWasmCompileCheck(
     compile_check_step: *std.Build.Step,
     optimize: std.builtin.OptimizeMode,
     build_config: *std.Build.Step.Options,
+    lto: std.zig.LtoMode,
 ) void {
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
-    const wasm = createWasmExecutable(b, wasm_target, optimize, build_config);
+    const wasm = createWasmExecutable(b, wasm_target, optimize, build_config, lto);
     compile_check_step.dependOn(&wasm.step);
+}
+
+fn createEmbedModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_config: *std.Build.Step.Options,
+) *std.Build.Module {
+    const uucode = sharedUucodeModule(b, target, optimize);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = !target.result.cpu.arch.isWasm(),
+        .imports = &.{
+            .{ .name = "uucode", .module = uucode },
+        },
+    });
+    module.addOptions("build_config", build_config);
+    return module;
 }
 
 fn createWasmExecutable(
@@ -209,26 +242,162 @@ fn createWasmExecutable(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     build_config: *std.Build.Step.Options,
+    lto: std.zig.LtoMode,
 ) *std.Build.Step.Compile {
-    const uucode = sharedUucodeModule(b, target, optimize);
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/wasm.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "uucode", .module = uucode },
-        },
-    });
-    root_module.addOptions("build_config", build_config);
-
     const wasm = b.addExecutable(.{
         .name = "rush",
-        .root_module = root_module,
+        .root_module = createEmbedModule(b, target, optimize, build_config),
     });
     wasm.rdynamic = true;
     wasm.export_table = true;
     wasm.entry = .disabled;
+    applyLto(wasm, lto);
     return wasm;
+}
+
+const NativeLibraries = struct {
+    static: *std.Build.Step.Compile,
+};
+
+fn addNativeLibraries(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_config: *std.Build.Step.Options,
+    version: std.SemanticVersion,
+    lto: std.zig.LtoMode,
+) NativeLibraries {
+    const module = createEmbedModule(b, target, optimize, build_config);
+    module.pic = true;
+
+    const shared = b.addLibrary(.{
+        .name = "rush",
+        .linkage = .dynamic,
+        .root_module = module,
+        .version = version,
+    });
+    configureEmbedLibrary(shared, .dynamic, lto);
+    shared.installHeadersDirectory(b.path("include"), ".", .{
+        .include_extensions = &.{".h"},
+    });
+
+    const static = b.addLibrary(.{
+        .name = "rush-static",
+        .linkage = .static,
+        .root_module = module,
+        .version = version,
+    });
+    configureEmbedLibrary(static, .static, lto);
+
+    const install_step = b.step("lib", "Build and install librush");
+    install_step.dependOn(&b.addInstallArtifact(shared, .{}).step);
+    install_step.dependOn(&b.addInstallLibFile(static.getEmittedBin(), staticLibraryName(target)).step);
+    install_step.dependOn(&b.addInstallHeaderFile(b.path("include/rush.h"), "rush.h").step);
+
+    const pcs = pkgConfigFiles(b, version, target.result.os.tag);
+    install_step.dependOn(&b.addInstallFileWithDir(pcs.shared, .prefix, "share/pkgconfig/librush.pc").step);
+    install_step.dependOn(&b.addInstallFileWithDir(pcs.static, .prefix, "share/pkgconfig/librush-static.pc").step);
+    b.getInstallStep().dependOn(install_step);
+
+    return .{ .static = static };
+}
+
+fn configureEmbedLibrary(
+    lib: *std.Build.Step.Compile,
+    linkage: std.builtin.LinkMode,
+    lto: std.zig.LtoMode,
+) void {
+    switch (linkage) {
+        .static => {
+            lib.bundle_compiler_rt = true;
+            lib.bundle_ubsan_rt = true;
+        },
+        .dynamic => {},
+    }
+    if (lib.rootModuleTarget().os.tag.isDarwin()) {
+        lib.use_llvm = true;
+        if (linkage == .dynamic) lib.headerpad_max_install_names = true;
+    }
+    applyLto(lib, lto);
+}
+
+fn applyLto(compile: *std.Build.Step.Compile, lto: std.zig.LtoMode) void {
+    compile.lto = lto;
+    if (lto != .none) compile.use_llvm = true;
+}
+
+fn staticLibraryName(target: std.Build.ResolvedTarget) []const u8 {
+    return if (target.result.os.tag == .windows) "rush-static.lib" else "librush.a";
+}
+
+const PkgConfigFiles = struct {
+    shared: std.Build.LazyPath,
+    static: std.Build.LazyPath,
+};
+
+fn pkgConfigFiles(
+    b: *std.Build,
+    version: std.SemanticVersion,
+    os_tag: std.Target.Os.Tag,
+) PkgConfigFiles {
+    const wf = b.addWriteFiles();
+    const static_name = if (os_tag == .windows) "rush-static.lib" else "librush.a";
+    return .{
+        .shared = wf.add("librush.pc", b.fmt(
+            \\prefix={s}
+            \\includedir=${{prefix}}/include
+            \\libdir=${{prefix}}/lib
+            \\
+            \\Name: librush
+            \\URL: https://github.com/rockorager/rush
+            \\Description: Embeddable Rush shell
+            \\Version: {f}
+            \\Cflags: -I${{includedir}}
+            \\Libs: -L${{libdir}} -lrush
+            \\Libs.private: -lc
+            \\
+        , .{ b.install_prefix, version })),
+        .static = wf.add("librush-static.pc", b.fmt(
+            \\prefix={s}
+            \\includedir=${{prefix}}/include
+            \\libdir=${{prefix}}/lib
+            \\
+            \\Name: librush-static
+            \\URL: https://github.com/rockorager/rush
+            \\Description: Embeddable Rush shell (static)
+            \\Version: {f}
+            \\Cflags: -DRUSH_STATIC -I${{includedir}}
+            \\Libs: ${{libdir}}/{s}
+            \\Libs.private: -lc
+            \\
+        , .{ b.install_prefix, version, static_name })),
+    };
+}
+
+fn addLibAbiTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    lib: *std.Build.Step.Compile,
+    test_step: *std.Build.Step,
+    test_no_run: bool,
+) void {
+    const abi_tests = b.addTest(.{
+        .name = "librush-abi",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/lib/abi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    abi_tests.root_module.addIncludePath(b.path("include"));
+    abi_tests.root_module.linkLibrary(lib);
+    if (test_no_run) {
+        test_step.dependOn(&abi_tests.step);
+    } else {
+        test_step.dependOn(&b.addRunArtifact(abi_tests).step);
+    }
 }
 
 fn addCompileChecks(
@@ -237,6 +406,8 @@ fn addCompileChecks(
     optimize: std.builtin.OptimizeMode,
     build_config: *std.Build.Step.Options,
     use_system_sqlite: bool,
+    version: std.SemanticVersion,
+    lto: std.zig.LtoMode,
 ) void {
     for (compile_check_targets) |target_name| {
         const target_query = std.Target.Query.parse(.{ .arch_os_abi = target_name }) catch |err|
@@ -257,14 +428,24 @@ fn addCompileChecks(
             check_zeit,
             build_config,
             use_system_sqlite,
-            .{ .link_libc = true },
+            .{ .link_libc = true, .lto = lto },
         );
         const check = b.addExecutable(.{
             .name = b.fmt("rush-{s}", .{target_name}),
             .root_module = check_module,
         });
         check.stack_size = rush_stack_size;
+        applyLto(check, lto);
         compile_check_step.dependOn(&check.step);
+
+        const check_lib = b.addLibrary(.{
+            .name = b.fmt("rush-static-{s}", .{target_name}),
+            .linkage = .static,
+            .root_module = createEmbedModule(b, check_target, optimize, build_config),
+            .version = version,
+        });
+        configureEmbedLibrary(check_lib, .static, lto);
+        compile_check_step.dependOn(&check_lib.step);
     }
 }
 
@@ -432,7 +613,7 @@ fn createRushRootModule(
     });
     module.addOptions("build_config", build_config);
     module.addAnonymousImport("default_config", .{ .root_source_file = generatedDefaultConfig(b) });
-    linkSqlite(b, module, use_system_sqlite);
+    linkSqlite(b, module, use_system_sqlite, options.lto);
     return module;
 }
 
@@ -472,7 +653,12 @@ fn sharedUucodeModule(
     }).module("uucode");
 }
 
-fn linkSqlite(b: *std.Build, module: *std.Build.Module, use_system_sqlite: bool) void {
+fn linkSqlite(
+    b: *std.Build,
+    module: *std.Build.Module,
+    use_system_sqlite: bool,
+    lto: std.zig.LtoMode,
+) void {
     if (use_system_sqlite) {
         module.linkSystemLibrary("sqlite3", .{
             .use_pkg_config = .yes,
@@ -505,6 +691,7 @@ fn linkSqlite(b: *std.Build, module: *std.Build.Module, use_system_sqlite: bool)
             "-DSQLITE_DEFAULT_MEMSTATUS=0",
         },
     });
+    applyLto(lib, lto);
     module.linkLibrary(lib);
     module.addIncludePath(sqlite.path("."));
     module.link_libc = true;
