@@ -75,8 +75,10 @@ pub fn parse(args: []const []const u8) ParseError!Invocation {
                 .positionals = args[index + 2 ..],
             } };
         }
-        if (arg.len > 1 and arg[0] == '-' and !std.mem.eql(u8, arg, "-c")) {
+        if (arg.len > 1 and arg[0] == '-') {
+            var command_string = false;
             for (arg[1..]) |option| switch (option) {
+                'c' => command_string = true,
                 'i' => {
                     options.interactive = true;
                     options.history = true;
@@ -87,22 +89,22 @@ pub fn parse(args: []const []const u8) ParseError!Invocation {
                 'x' => options.xtrace = true,
                 else => return error.UnsupportedOption,
             };
+            if (command_string) {
+                if (index + 1 >= args.len) return error.MissingCommandString;
+                const script = args[index + 1];
+                const operands = args[index + 2 ..];
+                const arg_zero = if (operands.len == 0) args[0] else operands[0];
+                const positionals = if (operands.len <= 1) &.{} else operands[1..];
+                options.mode = mode;
+                return .{ .command_string = .{
+                    .mode = mode,
+                    .options = options,
+                    .script = script,
+                    .arg_zero = arg_zero,
+                    .positionals = positionals,
+                } };
+            }
             continue;
-        }
-        if (std.mem.eql(u8, arg, "-c")) {
-            if (index + 1 >= args.len) return error.MissingCommandString;
-            const script = args[index + 1];
-            const operands = args[index + 2 ..];
-            const arg_zero = if (operands.len == 0) args[0] else operands[0];
-            const positionals = if (operands.len <= 1) &.{} else operands[1..];
-            options.mode = mode;
-            return .{ .command_string = .{
-                .mode = mode,
-                .options = options,
-                .script = script,
-                .arg_zero = arg_zero,
-                .positionals = positionals,
-            } };
         }
         if (arg.len != 0 and arg[0] == '-') return error.UnsupportedOption;
         options.mode = mode;
@@ -237,6 +239,20 @@ test "invocation parses xtrace option" {
     };
     try std.testing.expect(command.options.xtrace);
     try std.testing.expectEqual(state.Mode.posix, command.options.mode);
+}
+
+test "invocation parses command string in bundled short options" {
+    const args = [_][]const u8{ "rush", "-ucx", ":", "name", "arg" };
+    const invocation = try parse(&args);
+    const command = switch (invocation) {
+        .command_string => |command| command,
+        .help, .version, .interactive, .script_file => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(command.options.nounset);
+    try std.testing.expect(command.options.xtrace);
+    try std.testing.expectEqualStrings(":", command.script);
+    try std.testing.expectEqualStrings("name", command.arg_zero);
+    try std.testing.expectEqualSlices([]const u8, &.{"arg"}, command.positionals);
 }
 
 test "invocation parses nounset option" {
