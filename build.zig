@@ -163,7 +163,7 @@ pub fn build(b: *std.Build) void {
     } else {
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
-    addLibAbiTests(b, target, optimize, libs.static, test_step, test_no_run);
+    addLibAbiTests(b, target, optimize, libs, test_step, test_no_run);
 
     const conformance_step = b.step("conformance", "Run shell conformance tests");
     addConformanceTests(b, target, optimize, exe, conformance_step);
@@ -256,6 +256,7 @@ fn createWasmExecutable(
 }
 
 const NativeLibraries = struct {
+    shared: *std.Build.Step.Compile,
     static: *std.Build.Step.Compile,
 };
 
@@ -299,7 +300,7 @@ fn addNativeLibraries(
     install_step.dependOn(&b.addInstallFileWithDir(pcs.static, .prefix, "share/pkgconfig/librush-static.pc").step);
     b.getInstallStep().dependOn(install_step);
 
-    return .{ .static = static };
+    return .{ .shared = shared, .static = static };
 }
 
 fn configureEmbedLibrary(
@@ -378,12 +379,27 @@ fn addLibAbiTests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    lib: *std.Build.Step.Compile,
+    libs: NativeLibraries,
     test_step: *std.Build.Step,
     test_no_run: bool,
 ) void {
+    addLibAbiTest(b, target, optimize, libs.static, .static, test_step, test_no_run);
+    addLibAbiTest(b, target, optimize, libs.shared, .dynamic, test_step, test_no_run);
+}
+
+fn addLibAbiTest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    lib: *std.Build.Step.Compile,
+    linkage: std.builtin.LinkMode,
+    test_step: *std.Build.Step,
+    test_no_run: bool,
+) void {
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "static_linkage", linkage == .static);
     const abi_tests = b.addTest(.{
-        .name = "librush-abi",
+        .name = b.fmt("librush-{s}-abi", .{@tagName(linkage)}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/lib/abi.zig"),
             .target = target,
@@ -391,6 +407,7 @@ fn addLibAbiTests(
             .link_libc = true,
         }),
     });
+    abi_tests.root_module.addOptions("build_options", build_options);
     abi_tests.root_module.addIncludePath(b.path("include"));
     abi_tests.root_module.linkLibrary(lib);
     if (test_no_run) {
@@ -438,14 +455,25 @@ fn addCompileChecks(
         applyLto(check, lto);
         compile_check_step.dependOn(&check.step);
 
-        const check_lib = b.addLibrary(.{
+        const check_static = b.addLibrary(.{
             .name = b.fmt("rush-static-{s}", .{target_name}),
             .linkage = .static,
             .root_module = createEmbedModule(b, check_target, optimize, build_config),
             .version = version,
         });
-        configureEmbedLibrary(check_lib, .static, lto);
-        compile_check_step.dependOn(&check_lib.step);
+        configureEmbedLibrary(check_static, .static, lto);
+        compile_check_step.dependOn(&check_static.step);
+
+        const check_shared_module = createEmbedModule(b, check_target, optimize, build_config);
+        check_shared_module.pic = true;
+        const check_shared = b.addLibrary(.{
+            .name = b.fmt("rush-shared-{s}", .{target_name}),
+            .linkage = .dynamic,
+            .root_module = check_shared_module,
+            .version = version,
+        });
+        configureEmbedLibrary(check_shared, .dynamic, lto);
+        compile_check_step.dependOn(&check_shared.step);
     }
 }
 

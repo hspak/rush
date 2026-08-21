@@ -13,9 +13,16 @@ const host = @import("../host.zig");
 
 const empty_output: [1]u8 = .{0};
 
+const Descriptor = enum {
+    stdin,
+    stdout,
+    stderr,
+};
+
 allocator: std.mem.Allocator,
 stdout: std.ArrayList(u8) = .empty,
 stderr: std.ArrayList(u8) = .empty,
+descriptors: std.AutoHashMapUnmanaged(i32, Descriptor) = .empty,
 cwd: []u8,
 umask: u32 = 0o022,
 
@@ -63,15 +70,22 @@ pub const ChangeDirError = host.ChangeDirError;
 pub const CurrentDirError = host.CurrentDirError || std.mem.Allocator.Error;
 
 pub fn init(allocator: std.mem.Allocator) !WasmHost {
-    return .{
+    var wasm_host: WasmHost = .{
         .allocator = allocator,
         .cwd = try allocator.dupe(u8, "/"),
     };
+    errdefer allocator.free(wasm_host.cwd);
+    errdefer wasm_host.descriptors.deinit(allocator);
+    try wasm_host.descriptors.put(allocator, host.Fd.stdin.raw(), .stdin);
+    try wasm_host.descriptors.put(allocator, host.Fd.stdout.raw(), .stdout);
+    try wasm_host.descriptors.put(allocator, host.Fd.stderr.raw(), .stderr);
+    return wasm_host;
 }
 
 pub fn deinit(self: *WasmHost) void {
     self.stdout.deinit(self.allocator);
     self.stderr.deinit(self.allocator);
+    self.descriptors.deinit(self.allocator);
     self.allocator.free(self.cwd);
     self.* = undefined;
 }
@@ -107,11 +121,10 @@ pub fn wallTimeNs(_: *const WasmHost) i128 {
 }
 
 pub fn writeAll(self: *WasmHost, fd: host.Fd, bytes: []const u8) WriteError!void {
-    switch (fd) {
+    switch (self.descriptors.get(fd.raw()) orelse return error.BadFd) {
         .stdout => self.stdout.appendSlice(self.allocator, bytes) catch return error.SystemResources,
         .stderr => self.stderr.appendSlice(self.allocator, bytes) catch return error.SystemResources,
-        .stdin => {},
-        else => return error.BadFd,
+        .stdin => return error.BadFd,
     }
 }
 
@@ -120,11 +133,11 @@ pub fn write(self: *WasmHost, fd: host.Fd, bytes: []const u8) WriteError!usize {
     return bytes.len;
 }
 
-pub fn read(_: *const WasmHost, fd: host.Fd, buffer: []u8) ReadError!usize {
+pub fn read(self: *const WasmHost, fd: host.Fd, buffer: []u8) ReadError!usize {
     _ = buffer;
-    return switch (fd) {
+    return switch (self.descriptors.get(fd.raw()) orelse return error.Unexpected) {
         .stdin => 0,
-        else => error.Unexpected,
+        .stdout, .stderr => error.Unexpected,
     };
 }
 
@@ -141,26 +154,44 @@ pub fn openZ(_: *const WasmHost, path: [:0]const u8, _: host.OpenOptions) OpenEr
     return error.FileNotFound;
 }
 
-pub fn close(_: *const WasmHost, _: host.Fd) CloseError!void {}
+pub fn close(self: *WasmHost, fd: host.Fd) CloseError!void {
+    if (!self.descriptors.remove(fd.raw())) return error.Unexpected;
+}
 
 pub fn deleteFileZ(_: *const WasmHost, path: [:0]const u8) DeleteFileError!void {
     std.debug.assert(path.len != 0);
     return error.FileNotFound;
 }
 
-pub fn duplicate(_: *const WasmHost, _: host.Fd) DuplicateError!host.Fd {
-    return error.BadFd;
+pub fn duplicate(self: *WasmHost, fd: host.Fd) DuplicateError!host.Fd {
+    return self.duplicateAtLeast(fd, 0);
 }
 
-pub fn duplicateAtLeast(_: *const WasmHost, _: host.Fd, _: u31) DuplicateError!host.Fd {
-    return error.BadFd;
+pub fn duplicateAtLeast(self: *WasmHost, fd: host.Fd, min_fd: u31) DuplicateError!host.Fd {
+    const descriptor = self.descriptors.get(fd.raw()) orelse return error.BadFd;
+    const duplicate_fd = self.availableFd(min_fd) orelse return error.SystemResources;
+    self.descriptors.put(self.allocator, duplicate_fd.raw(), descriptor) catch return error.SystemResources;
+    return duplicate_fd;
 }
 
-pub fn duplicateTo(_: *const WasmHost, _: host.Fd, _: host.Fd) DuplicateError!void {
-    return error.BadFd;
+pub fn duplicateTo(self: *WasmHost, from: host.Fd, to: host.Fd) DuplicateError!void {
+    const descriptor = self.descriptors.get(from.raw()) orelse return error.BadFd;
+    if (from == to) return;
+    self.descriptors.put(self.allocator, to.raw(), descriptor) catch return error.SystemResources;
 }
 
-pub fn setCloseOnExec(_: *const WasmHost, _: host.Fd, _: bool) FdFlagError!void {}
+pub fn setCloseOnExec(self: *const WasmHost, fd: host.Fd, _: bool) FdFlagError!void {
+    if (!self.descriptors.contains(fd.raw())) return error.BadFd;
+}
+
+fn availableFd(self: *const WasmHost, min_fd: u31) ?host.Fd {
+    var raw_fd: i32 = @intCast(min_fd);
+    while (self.descriptors.contains(raw_fd)) {
+        if (raw_fd == std.math.maxInt(i32)) return null;
+        raw_fd += 1;
+    }
+    return @enumFromInt(raw_fd);
+}
 
 pub fn pipe(_: *const WasmHost) PipeError!host.Pipe {
     return error.SystemResources;
@@ -403,4 +434,19 @@ test "WasmHost virtual cwd tracks cd" {
     try std.testing.expectEqualStrings("/tmp", wasm_host.cwd);
     try wasm_host.changeDir("..");
     try std.testing.expectEqualStrings("/", wasm_host.cwd);
+}
+
+test "WasmHost duplicates, routes, and closes descriptors" {
+    var wasm_host = try WasmHost.init(std.testing.allocator);
+    defer wasm_host.deinit();
+
+    const saved_stdout = try wasm_host.duplicateAtLeast(.stdout, 10);
+    try wasm_host.duplicateTo(.stderr, .stdout);
+    try wasm_host.writeAll(.stdout, "error\n");
+    try std.testing.expectEqualStrings("error\n", wasm_host.stderrSlice());
+
+    try wasm_host.duplicateTo(saved_stdout, .stdout);
+    try wasm_host.close(saved_stdout);
+    try wasm_host.close(.stdout);
+    try std.testing.expectError(error.BadFd, wasm_host.writeAll(.stdout, "hidden\n"));
 }

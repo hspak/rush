@@ -1,8 +1,9 @@
 //! Links the installed C ABI (`librush`) and checks eval plus output capture.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @cImport({
-    @cDefine("RUSH_STATIC", "1");
+    if (build_options.static_linkage) @cDefine("RUSH_STATIC", "1");
     @cInclude("rush.h");
 });
 
@@ -19,6 +20,22 @@ test "eval captures stdout" {
     try std.testing.expectEqualStrings(
         "hello\n",
         captured(c.rush_stdout_ptr(instance), c.rush_stdout_len(instance)),
+    );
+}
+
+test "standard descriptor redirections route and close output" {
+    const instance = c.rush_create() orelse return error.CreateFailed;
+    defer c.rush_destroy(instance);
+
+    const src = "echo error >&2; echo hidden >&-; echo visible";
+    try std.testing.expectEqual(@as(u8, 0), c.rush_eval(instance, src.ptr, src.len));
+    try std.testing.expectEqualStrings(
+        "visible\n",
+        captured(c.rush_stdout_ptr(instance), c.rush_stdout_len(instance)),
+    );
+    try std.testing.expectEqualStrings(
+        "error\necho: write failed\n",
+        captured(c.rush_stderr_ptr(instance), c.rush_stderr_len(instance)),
     );
 }
 

@@ -110,6 +110,27 @@ test "persistent session reports unavailable pipelines" {
     try std.testing.expectEqualStrings("rush: shell error\n", session.shell.host.stderrSlice());
 }
 
+test "persistent session routes standard descriptor redirections" {
+    var session = try WasmSession.init(std.testing.allocator);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), session.evalScript("echo error >&2"));
+    try std.testing.expectEqualStrings("", session.shell.host.stdoutSlice());
+    try std.testing.expectEqualStrings("error\n", session.shell.host.stderrSlice());
+}
+
+test "persistent session honors temporary and persistent descriptor closure" {
+    var session = try WasmSession.init(std.testing.allocator);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), session.evalScript("echo hidden >&-; echo visible"));
+    try std.testing.expectEqualStrings("visible\n", session.shell.host.stdoutSlice());
+
+    try std.testing.expectEqual(@as(u8, 0), session.evalScript("exec 1>&-"));
+    try std.testing.expect(session.evalScript("echo hidden") != 0);
+    try std.testing.expectEqualStrings("", session.shell.host.stdoutSlice());
+}
+
 test "persistent session retains an EXIT trap failure status" {
     var session = try WasmSession.init(std.testing.allocator);
     defer session.deinit();
