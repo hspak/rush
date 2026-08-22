@@ -72,6 +72,14 @@ test "finished session retains an EXIT trap failure status" {
 
     const ignored_src = "echo still";
     try std.testing.expectEqual(@as(u8, 2), c.rush_eval(instance, ignored_src.ptr, ignored_src.len));
+    try std.testing.expectEqualStrings(
+        "",
+        captured(c.rush_stdout_ptr(instance), c.rush_stdout_len(instance)),
+    );
+    try std.testing.expectEqualStrings(
+        "",
+        captured(c.rush_stderr_ptr(instance), c.rush_stderr_len(instance)),
+    );
 }
 
 test "nullable cleanup and allocation edge cases" {

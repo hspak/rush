@@ -34,9 +34,9 @@ pub fn deinit(self: *WasmSession) void {
 }
 
 pub fn evalScript(self: *WasmSession, text: []const u8) u8 {
+    self.shell.host.clearOutput();
     if (self.finished) return self.exit_status;
 
-    self.shell.host.clearOutput();
     self.shell.resetForTopLevelCommand();
     const src: shell_mod.source.Source = .{
         .id = 1,
@@ -98,7 +98,7 @@ test "persistent session runs EXIT on exit builtin and ignores later eval" {
     try std.testing.expectEqual(@as(u8, 7), session.evalScript("exit 7"));
     try std.testing.expectEqualStrings("bye\n", session.shell.host.stdoutSlice());
     try std.testing.expectEqual(@as(u8, 7), session.evalScript("echo still"));
-    try std.testing.expectEqualStrings("bye\n", session.shell.host.stdoutSlice());
+    try std.testing.expectEqualStrings("", session.shell.host.stdoutSlice());
     try std.testing.expectEqual(@as(u8, 7), session.finish());
 }
 
@@ -138,5 +138,5 @@ test "persistent session retains an EXIT trap failure status" {
     try std.testing.expectEqual(@as(u8, 2), session.evalScript("trap 'echo a | echo b' EXIT; exit 7"));
     try std.testing.expectEqualStrings("rush: shell error\n", session.shell.host.stderrSlice());
     try std.testing.expectEqual(@as(u8, 2), session.evalScript("echo still"));
-    try std.testing.expectEqualStrings("rush: shell error\n", session.shell.host.stderrSlice());
+    try std.testing.expectEqualStrings("", session.shell.host.stderrSlice());
 }
