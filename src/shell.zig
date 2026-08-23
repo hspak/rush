@@ -17,6 +17,7 @@ pub const result = @import("shell/result.zig");
 pub const source = @import("shell/source.zig");
 pub const state = @import("shell/state.zig");
 pub const token = @import("shell/token.zig");
+pub const word_quoting = @import("shell/word_quoting.zig");
 
 pub const Shell = shell_factory.Shell;
 pub const ShellWithBuiltins = shell_factory.ShellWithBuiltins;
