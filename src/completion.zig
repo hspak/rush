@@ -34,28 +34,49 @@ pub fn complete(
 
     if (analyzed.kind == .parameter) {
         try appendVariableCandidates(allocator, &builder, sh, analyzed.replace_start, analyzed.replace_end);
-        return applyBuiltCandidates(allocator, source, &builder);
+        return applyBuiltCandidates(allocator, source, &builder, analyzed);
     }
 
     if (analyzed.kind == .command) {
-        if (std.mem.indexOfScalar(u8, analyzed.prefix, '/') == null) {
+        const command_prefix = if (analyzed.literal_prefix) |literal| literal.value else analyzed.prefix;
+        if (std.mem.indexOfScalar(u8, command_prefix, '/') == null) {
             try appendCommandCandidates(allocator, &builder, sh, analyzed.replace_start, analyzed.replace_end);
-            return applyBuiltCandidates(allocator, source, &builder);
+            return applyBuiltCandidates(allocator, source, &builder, analyzed);
         }
-        // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-        try appendPathCandidates(allocator, &builder, sh, analyzed.prefix, analyzed.replace_start, analyzed.replace_end, false);
-        return applyBuiltCandidates(allocator, source, &builder);
+        if (analyzed.literal_prefix) |literal| {
+            try appendPathCandidates(
+                allocator,
+                &builder,
+                sh,
+                literal.value,
+                literal.expands_leading_tilde,
+                analyzed.replace_start,
+                analyzed.replace_end,
+                false,
+            );
+        }
+        return applyBuiltCandidates(allocator, source, &builder, analyzed);
     }
 
     if (analyzed.root) |root| {
         if (try completeFromManifest(allocator, io, sh, &builder, analyzed, root)) |handled| {
-            if (handled) return applyBuiltCandidates(allocator, source, &builder);
+            if (handled) return applyBuiltCandidates(allocator, source, &builder, analyzed);
         }
     }
 
-    // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-    try appendPathCandidates(allocator, &builder, sh, analyzed.prefix, analyzed.replace_start, analyzed.replace_end, false);
-    return applyBuiltCandidates(allocator, source, &builder);
+    if (analyzed.literal_prefix) |literal| {
+        try appendPathCandidates(
+            allocator,
+            &builder,
+            sh,
+            literal.value,
+            literal.expands_leading_tilde,
+            analyzed.replace_start,
+            analyzed.replace_end,
+            false,
+        );
+    }
+    return applyBuiltCandidates(allocator, source, &builder, analyzed);
 }
 
 fn rushShellFromOpaque(context: *anyopaque) *shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry) {
@@ -76,12 +97,19 @@ const AnalyzedLine = struct {
     replace_start: usize,
     replace_end: usize,
     prefix: []const u8,
+    /// Literal value of the typed word up to the cursor. Null when evaluation
+    /// would be required to determine it.
+    literal_prefix: ?shell.word_quoting.LiteralWord,
+    /// Literal value of the full current word, used for candidate matching.
+    literal_query: ?shell.word_quoting.LiteralWord,
     kind: CompletionKind,
     root: ?[]const u8,
     command_word_index: ?usize,
 
     fn deinit(self: AnalyzedLine, allocator: std.mem.Allocator) void {
         allocator.free(self.words);
+        if (self.literal_prefix) |literal| literal.deinit(allocator);
+        if (self.literal_query) |literal| literal.deinit(allocator);
     }
 };
 
@@ -146,8 +174,16 @@ fn analyzeLine(allocator: std.mem.Allocator, source: []const u8, raw_cursor: usi
     const replace_start = if (current_word_index) |index| words.items[index].start else cursor;
     const replace_end = if (current_word_index) |index| words.items[index].end else cursor;
     const raw_prefix = source[replace_start..cursor];
-    const parameter = raw_prefix.len != 0 and raw_prefix[0] == '$';
+    // Issue 8 dollar-single-quotes begin with `$'`, but are literal words rather
+    // than parameter expansions.
+    const parameter = raw_prefix.len != 0 and raw_prefix[0] == '$' and
+        (raw_prefix.len == 1 or raw_prefix[1] != '\'');
     const prefix = if (parameter) raw_prefix[1..] else raw_prefix;
+    const word_start = if (parameter) replace_start + 1 else replace_start;
+    const literal_prefix = try shell.word_quoting.parseLiteralWord(allocator, prefix);
+    errdefer if (literal_prefix) |literal| literal.deinit(allocator);
+    const literal_query = try shell.word_quoting.parseLiteralWord(allocator, source[word_start..replace_end]);
+    errdefer if (literal_query) |literal| literal.deinit(allocator);
 
     const is_command = if (current_word_class) |class|
         class == .command or class == .reserved
@@ -159,9 +195,11 @@ fn analyzeLine(allocator: std.mem.Allocator, source: []const u8, raw_cursor: usi
     return .{
         .words = try words.toOwnedSlice(allocator),
         .current_word_index = current_word_index,
-        .replace_start = if (parameter) replace_start + 1 else replace_start,
+        .replace_start = word_start,
         .replace_end = replace_end,
         .prefix = prefix,
+        .literal_prefix = literal_prefix,
+        .literal_query = literal_query,
         .kind = kind,
         .root = root,
         .command_word_index = command_word_index,
@@ -255,19 +293,66 @@ const Builder = struct {
     }
 };
 
-fn applyBuiltCandidates(allocator: std.mem.Allocator, source: []const u8, builder: *Builder) !Application {
+fn applyBuiltCandidates(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    builder: *Builder,
+    analyzed: AnalyzedLine,
+) !Application {
     const candidates = try builder.take(allocator);
     defer editor_completion.freeCandidates(allocator, candidates);
 
     var matches: std.ArrayList(editor_completion.Candidate) = .empty;
     defer matches.deinit(allocator);
-    for (candidates) |candidate| {
-        const query = source[candidate.replace_start..candidate.replace_end];
-        if (editor_completion.candidateMatchRank(candidate, query, .prefixOnly()) != null) {
-            try matches.append(allocator, candidate);
+    for (candidates) |*candidate| {
+        try preparePathCandidateInsert(allocator, candidate, analyzed);
+        const query = if (analyzed.literal_query) |literal|
+            if (candidateUsesLiteralQuery(candidate.*) and
+                candidate.replace_start == analyzed.replace_start and
+                candidate.replace_end == analyzed.replace_end)
+                literal.value
+            else
+                source[candidate.replace_start..candidate.replace_end]
+        else
+            source[candidate.replace_start..candidate.replace_end];
+        if (editor_completion.candidateMatchRank(candidate.*, query, .prefixOnly()) != null) {
+            try matches.append(allocator, candidate.*);
         }
     }
     return editor_completion.applyCandidates(allocator, matches.items);
+}
+
+fn candidateUsesLiteralQuery(candidate: editor_completion.Candidate) bool {
+    return candidate.kind == .file or candidate.kind == .directory or
+        (candidate.kind == .command and candidate.insert != null);
+}
+
+fn preparePathCandidateInsert(
+    allocator: std.mem.Allocator,
+    candidate: *editor_completion.Candidate,
+    analyzed: AnalyzedLine,
+) error{OutOfMemory}!void {
+    if (candidate.insert != null or (candidate.kind != .file and candidate.kind != .directory)) return;
+
+    const escaped_value: ?[]const u8 = if (analyzed.literal_prefix) |literal|
+        if (literal.open_quote) |style|
+            try shell.word_quoting.quote(allocator, candidate.value, style, .{
+                .close = candidate.kind != .directory or candidate.suffix != null,
+            })
+        else
+            try shell.word_quoting.escapeIfNeeded(allocator, candidate.value, .{
+                .preserve_leading_tilde = literal.expands_leading_tilde,
+            })
+    else
+        try shell.word_quoting.escapeIfNeeded(allocator, candidate.value, .{});
+    const owned_value = escaped_value orelse return;
+
+    if (candidate.suffix) |suffix| {
+        defer allocator.free(owned_value);
+        candidate.insert = try std.mem.concat(allocator, u8, &.{ owned_value, suffix });
+    } else {
+        candidate.insert = owned_value;
+    }
 }
 
 fn completeFromManifest(
@@ -536,10 +621,32 @@ fn appendProviderCandidates(
 
 // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
 fn appendBuiltinProvider(allocator: std.mem.Allocator, builder: *Builder, sh: anytype, analyzed: AnalyzedLine, name: []const u8) !void {
-    // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-    if (std.mem.eql(u8, name, "files")) return appendPathCandidates(allocator, builder, sh, analyzed.prefix, analyzed.replace_start, analyzed.replace_end, false);
-    // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-    if (std.mem.eql(u8, name, "directories")) return appendPathCandidates(allocator, builder, sh, analyzed.prefix, analyzed.replace_start, analyzed.replace_end, true);
+    if (std.mem.eql(u8, name, "files")) {
+        const literal = analyzed.literal_prefix orelse return;
+        return appendPathCandidates(
+            allocator,
+            builder,
+            sh,
+            literal.value,
+            literal.expands_leading_tilde,
+            analyzed.replace_start,
+            analyzed.replace_end,
+            false,
+        );
+    }
+    if (std.mem.eql(u8, name, "directories")) {
+        const literal = analyzed.literal_prefix orelse return;
+        return appendPathCandidates(
+            allocator,
+            builder,
+            sh,
+            literal.value,
+            literal.expands_leading_tilde,
+            analyzed.replace_start,
+            analyzed.replace_end,
+            true,
+        );
+    }
     // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
     if (std.mem.eql(u8, name, "executables")) return appendPathExecutableCandidates(allocator, builder, sh, analyzed.replace_start, analyzed.replace_end);
     // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
@@ -596,9 +703,11 @@ fn appendFunctionProvider(
     defer allocator.free(parsed_options);
     const operands = try operandsForProvider(allocator, analyzed, root_command);
     defer allocator.free(operands);
+    const provider_prefix = if (analyzed.literal_prefix) |literal| literal.value else analyzed.prefix;
     var provider_context = extensions.rush.CompletionContext.init(
         allocator,
-        analyzed.prefix,
+        provider_prefix,
+        if (analyzed.literal_prefix) |literal| literal.expands_leading_tilde else false,
         analyzed.replace_start,
         analyzed.replace_end,
         semantic.operand_index,
@@ -619,7 +728,7 @@ fn appendFunctionProvider(
     sh.state.removeVariable("rush_completion_argument_index");
     sh.state.removeVariable("rush_completion_options_terminated");
     sh.state.removeVariable("rush_completion_value_position");
-    try sh.state.putVariable(.{ .name = "rush_completion_prefix", .value = analyzed.prefix });
+    try sh.state.putVariable(.{ .name = "rush_completion_prefix", .value = provider_prefix });
     try sh.state.putVariable(.{ .name = "rush_completion_argument_index", .value = argument_index });
     // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
     try sh.state.putVariable(.{ .name = "rush_completion_options_terminated", .value = if (semantic.options_terminated) "true" else "false" });
@@ -963,25 +1072,35 @@ fn appendPathExecutableCandidates(allocator: std.mem.Allocator, builder: *Builde
             const full_path_z = try allocator.dupeZ(u8, full_path);
             defer allocator.free(full_path_z);
             if (!sh.host.fileAccessZ(full_path_z, .execute)) continue;
+            const insert = try shell.word_quoting.escapeIfNeeded(allocator, entry.name, .{});
+            defer if (insert) |owned| allocator.free(owned);
             // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-            try builder.append(allocator, .{ .value = entry.name, .kind = .command, .replace_start = replace_start, .replace_end = replace_end });
+            try builder.append(allocator, .{ .value = entry.name, .insert = insert, .kind = .command, .replace_start = replace_start, .replace_end = replace_end });
         }
     }
 }
 
 // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-fn appendPathCandidates(allocator: std.mem.Allocator, builder: *Builder, sh: anytype, prefix: []const u8, replace_start: usize, replace_end: usize, directories_only: bool) !void {
+fn appendPathCandidates(
+    allocator: std.mem.Allocator,
+    builder: *Builder,
+    sh: anytype,
+    prefix: []const u8,
+    expand_leading_tilde: bool,
+    replace_start: usize,
+    replace_end: usize,
+    directories_only: bool,
+) !void {
     // ziglint-ignore: Z011 deprecated API left unchanged to avoid semantic drift in lint-only pass
     const slash = std.mem.lastIndexOfScalar(u8, prefix, '/');
     const dir_prefix = if (slash) |index| prefix[0 .. index + 1] else "";
     const entry_prefix = if (slash) |index| prefix[index + 1 ..] else prefix;
     // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
     const unexpanded_dir_path = if (dir_prefix.len == 0) "." else if (std.mem.eql(u8, dir_prefix, "/")) "/" else std.mem.trimEnd(u8, dir_prefix, "/");
-    const dir_path = try completion_path.expandLeadingTilde(
-        allocator,
-        unexpanded_dir_path,
-        shellValue(sh, "HOME"),
-    );
+    const dir_path = if (expand_leading_tilde)
+        try completion_path.expandLeadingTilde(allocator, unexpanded_dir_path, shellValue(sh, "HOME"))
+    else
+        try allocator.dupe(u8, unexpanded_dir_path);
     defer allocator.free(dir_path);
     var entries = sh.host.listDir(allocator, dir_path) catch return;
     defer entries.deinit();
@@ -989,7 +1108,7 @@ fn appendPathCandidates(allocator: std.mem.Allocator, builder: *Builder, sh: any
     for (entries.entries) |entry| {
         if (entry.name.len == 0 or std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
         if (!include_hidden and entry.name[0] == '.') continue;
-        const is_directory = try pathCandidateIsDirectory(allocator, sh, dir_prefix, entry);
+        const is_directory = try pathCandidateIsDirectory(allocator, sh, dir_prefix, expand_leading_tilde, entry);
         if (directories_only and !is_directory) continue;
         const value = if (is_directory)
             try std.fmt.allocPrint(allocator, "{s}{s}/", .{ dir_prefix, entry.name })
@@ -1005,6 +1124,7 @@ fn pathCandidateIsDirectory(
     allocator: std.mem.Allocator,
     sh: anytype,
     dir_prefix: []const u8,
+    expand_leading_tilde: bool,
     entry: host.DirectoryEntry,
 ) !bool {
     if (entry.kind == .directory) return true;
@@ -1012,11 +1132,10 @@ fn pathCandidateIsDirectory(
 
     const unexpanded_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, entry.name });
     defer allocator.free(unexpanded_path);
-    const path = try completion_path.expandLeadingTilde(
-        allocator,
-        unexpanded_path,
-        shellValue(sh, "HOME"),
-    );
+    const path = if (expand_leading_tilde)
+        try completion_path.expandLeadingTilde(allocator, unexpanded_path, shellValue(sh, "HOME"))
+    else
+        try allocator.dupe(u8, unexpanded_path);
     defer allocator.free(path);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
@@ -1449,6 +1568,10 @@ test "path completion follows symlinked directories before appending space" {
         env: []const [*:0]const u8 = &.{},
     };
 
+    const source = "nvim .config/ru";
+    const analyzed = try analyzeLine(std.testing.allocator, source, source.len);
+    defer analyzed.deinit(std.testing.allocator);
+    const literal = analyzed.literal_prefix orelse return error.ExpectedLiteralPath;
     var sh: TestShell = .{ .host = .{}, .state = .{} };
     var builder: Builder = .{};
     defer builder.deinit(std.testing.allocator);
@@ -1457,12 +1580,13 @@ test "path completion follows symlinked directories before appending space" {
         std.testing.allocator,
         &builder,
         &sh,
-        ".config/ru",
-        "nvim ".len,
-        "nvim .config/ru".len,
+        literal.value,
+        literal.expands_leading_tilde,
+        analyzed.replace_start,
+        analyzed.replace_end,
         false,
     );
-    var application = try applyBuiltCandidates(std.testing.allocator, "nvim .config/ru", &builder);
+    var application = try applyBuiltCandidates(std.testing.allocator, source, &builder, analyzed);
     defer application.deinit(std.testing.allocator);
 
     const edit = switch (application) {
@@ -1504,6 +1628,9 @@ test "path completion expands tilde for lookup and preserves it in candidates" {
     };
 
     const source = "nvim ~/.config/ru";
+    const analyzed = try analyzeLine(std.testing.allocator, source, source.len);
+    defer analyzed.deinit(std.testing.allocator);
+    const literal = analyzed.literal_prefix orelse return error.ExpectedLiteralPath;
     var sh: TestShell = .{ .host = .{}, .state = .{} };
     var builder: Builder = .{};
     defer builder.deinit(std.testing.allocator);
@@ -1512,12 +1639,13 @@ test "path completion expands tilde for lookup and preserves it in candidates" {
         std.testing.allocator,
         &builder,
         &sh,
-        "~/.config/ru",
-        "nvim ".len,
-        source.len,
+        literal.value,
+        literal.expands_leading_tilde,
+        analyzed.replace_start,
+        analyzed.replace_end,
         false,
     );
-    var application = try applyBuiltCandidates(std.testing.allocator, source, &builder);
+    var application = try applyBuiltCandidates(std.testing.allocator, source, &builder, analyzed);
     defer application.deinit(std.testing.allocator);
 
     const edit = switch (application) {
@@ -1526,4 +1654,327 @@ test "path completion expands tilde for lookup and preserves it in candidates" {
     };
     try std.testing.expectEqualStrings("~/.config/rush/", edit.replacement);
     try std.testing.expect(!edit.append_space);
+}
+
+const PathCompletionTestState = struct {
+    home: ?[]const u8 = null,
+
+    fn getVariable(self: PathCompletionTestState, name: []const u8) ?shell.state.Variable {
+        if (!std.mem.eql(u8, name, "HOME")) return null;
+        const home = self.home orelse return null;
+        return .{ .name = "HOME", .value = home };
+    }
+};
+
+const PathCompletionTestHost = struct {
+    expected_path: []const u8,
+    entry_name: []const u8,
+    entry_kind: host.FileKind,
+
+    pub fn listDir(self: *PathCompletionTestHost, allocator: std.mem.Allocator, path: []const u8) !host.ListDirResult {
+        try std.testing.expectEqualStrings(self.expected_path, path);
+        const entries = try allocator.alloc(host.DirectoryEntry, 1);
+        errdefer allocator.free(entries);
+        entries[0] = .{
+            .name = try allocator.dupe(u8, self.entry_name),
+            .kind = self.entry_kind,
+        };
+        return .{ .allocator = allocator, .entries = entries };
+    }
+
+    pub fn fileTestStatusZ(_: *PathCompletionTestHost, _: [:0]const u8, _: bool) ?host.FileStatus {
+        unreachable;
+    }
+};
+
+const PathCompletionTestShell = struct {
+    host: PathCompletionTestHost,
+    state: PathCompletionTestState,
+    env: []const [*:0]const u8 = &.{},
+};
+
+fn expectPathCompletion(
+    source_text: []const u8,
+    expected_lookup_path: []const u8,
+    entry_name: []const u8,
+    entry_kind: host.FileKind,
+    home: ?[]const u8,
+    expected_replacement: []const u8,
+    expected_append_space: bool,
+) !void {
+    const analyzed = try analyzeLine(std.testing.allocator, source_text, source_text.len);
+    defer analyzed.deinit(std.testing.allocator);
+    const literal = analyzed.literal_prefix orelse return error.ExpectedLiteralPath;
+
+    var sh: PathCompletionTestShell = .{
+        .host = .{
+            .expected_path = expected_lookup_path,
+            .entry_name = entry_name,
+            .entry_kind = entry_kind,
+        },
+        .state = .{ .home = home },
+    };
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+    try appendPathCandidates(
+        std.testing.allocator,
+        &builder,
+        &sh,
+        literal.value,
+        literal.expands_leading_tilde,
+        analyzed.replace_start,
+        analyzed.replace_end,
+        false,
+    );
+
+    var application = try applyBuiltCandidates(std.testing.allocator, source_text, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedSinglePathCompletion,
+    };
+    try std.testing.expectEqualStrings(expected_replacement, edit.replacement);
+    try std.testing.expectEqual(expected_append_space, edit.append_space);
+}
+
+test "path completion preserves a simple open quote and safely respells fallbacks" {
+    const Case = struct {
+        source: []const u8,
+        lookup_path: []const u8,
+        entry_name: []const u8,
+        entry_kind: host.FileKind = .file,
+        home: ?[]const u8 = null,
+        replacement: []const u8,
+        append_space: bool = true,
+    };
+    const cases = [_]Case{
+        .{
+            .source = "cat my",
+            .lookup_path = ".",
+            .entry_name = "my file.txt",
+            .replacement = "my\\ file.txt",
+        },
+        .{
+            .source = "cat my\\ f",
+            .lookup_path = ".",
+            .entry_name = "my file.txt",
+            .replacement = "my\\ file.txt",
+        },
+        .{
+            .source = "cat 'my f",
+            .lookup_path = ".",
+            .entry_name = "my file.txt",
+            .replacement = "'my file.txt'",
+        },
+        .{
+            .source = "cat \"my f",
+            .lookup_path = ".",
+            .entry_name = "my file.txt",
+            .replacement = "\"my file.txt\"",
+        },
+        .{
+            .source = "cat $'my\\x20f",
+            .lookup_path = ".",
+            .entry_name = "my file.txt",
+            .replacement = "$'my file.txt'",
+        },
+        .{
+            .source = "cat 'it",
+            .lookup_path = ".",
+            .entry_name = "it's here",
+            .replacement = "'it'\\''s here'",
+        },
+        .{
+            .source = "cat \"cash",
+            .lookup_path = ".",
+            .entry_name = "cash$ file",
+            .replacement = "\"cash\\$ file\"",
+        },
+        .{
+            .source = "cat $'line",
+            .lookup_path = ".",
+            .entry_name = "line\nbreak",
+            .replacement = "$'line\\nbreak'",
+        },
+        .{
+            .source = "cat pre\"my f",
+            .lookup_path = ".",
+            .entry_name = "premy file",
+            .replacement = "premy\\ file",
+        },
+        .{
+            .source = "cat 'my 'f",
+            .lookup_path = ".",
+            .entry_name = "my file",
+            .replacement = "my\\ file",
+        },
+        .{
+            .source = "cat my\\ dir/ch",
+            .lookup_path = "my dir",
+            .entry_name = "child file",
+            .replacement = "my\\ dir/child\\ file",
+        },
+        .{
+            .source = "cat 'my dir/ch",
+            .lookup_path = "my dir",
+            .entry_name = "child file",
+            .replacement = "'my dir/child file'",
+        },
+        .{
+            .source = "cat ~/my",
+            .lookup_path = "/home/alice",
+            .entry_name = "my file",
+            .home = "/home/alice",
+            .replacement = "~/my\\ file",
+        },
+        .{
+            .source = "cat ~/\"my",
+            .lookup_path = "/home/alice",
+            .entry_name = "my file",
+            .home = "/home/alice",
+            .replacement = "~/my\\ file",
+        },
+        .{
+            .source = "cat '~/my",
+            .lookup_path = "~",
+            .entry_name = "my file",
+            .replacement = "'~/my file'",
+        },
+        .{
+            .source = "cat \\~/my",
+            .lookup_path = "~",
+            .entry_name = "my file",
+            .replacement = "\\~/my\\ file",
+        },
+        .{
+            .source = "cd my",
+            .lookup_path = ".",
+            .entry_name = "my dir",
+            .entry_kind = .directory,
+            .replacement = "my\\ dir/",
+            .append_space = false,
+        },
+        .{
+            .source = "cd 'my",
+            .lookup_path = ".",
+            .entry_name = "my dir",
+            .entry_kind = .directory,
+            .replacement = "'my dir/",
+            .append_space = false,
+        },
+    };
+    for (cases) |case| {
+        try expectPathCompletion(
+            case.source,
+            case.lookup_path,
+            case.entry_name,
+            case.entry_kind,
+            case.home,
+            case.replacement,
+            case.append_space,
+        );
+    }
+}
+
+test "ambiguous path candidates preserve open quoting in their insert text" {
+    const source_text = "cat 'my";
+    const analyzed = try analyzeLine(std.testing.allocator, source_text, source_text.len);
+    defer analyzed.deinit(std.testing.allocator);
+
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+    for ([_][]const u8{ "my file", "my folder" }) |value| {
+        try builder.append(std.testing.allocator, .{
+            .value = value,
+            .kind = .file,
+            .replace_start = analyzed.replace_start,
+            .replace_end = analyzed.replace_end,
+        });
+    }
+
+    var application = try applyBuiltCandidates(std.testing.allocator, source_text, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+    const candidates = switch (application) {
+        .ambiguous => |candidates| candidates,
+        else => return error.ExpectedAmbiguousPathCompletion,
+    };
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try std.testing.expectEqualStrings("my file", candidates[0].value);
+    try std.testing.expectEqualStrings("'my file'", candidates[0].insert.?);
+    try std.testing.expectEqualStrings("my folder", candidates[1].value);
+    try std.testing.expectEqualStrings("'my folder'", candidates[1].insert.?);
+}
+
+test "provider file candidates receive shell-safe inserts at the shared boundary" {
+    const source_text = "git add my";
+    const analyzed = try analyzeLine(std.testing.allocator, source_text, source_text.len);
+    defer analyzed.deinit(std.testing.allocator);
+
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+    try builder.append(std.testing.allocator, .{
+        .value = "my file",
+        .kind = .file,
+        .replace_start = analyzed.replace_start,
+        .replace_end = analyzed.replace_end,
+    });
+
+    var application = try applyBuiltCandidates(std.testing.allocator, source_text, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedProviderPathCompletion,
+    };
+    try std.testing.expectEqualStrings("my\\ file", edit.replacement);
+}
+
+test "provider-supplied inserts remain authoritative" {
+    const source_text = "git add my";
+    const analyzed = try analyzeLine(std.testing.allocator, source_text, source_text.len);
+    defer analyzed.deinit(std.testing.allocator);
+
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+    try builder.append(std.testing.allocator, .{
+        .value = "my file",
+        .insert = "'my file'",
+        .kind = .file,
+        .replace_start = analyzed.replace_start,
+        .replace_end = analyzed.replace_end,
+    });
+
+    var application = try applyBuiltCandidates(std.testing.allocator, source_text, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedProviderPathCompletion,
+    };
+    try std.testing.expectEqualStrings("'my file'", edit.replacement);
+}
+
+test "quoted path candidates keep provider suffixes outside the quote" {
+    const source_text = "git add 'my";
+    const analyzed = try analyzeLine(std.testing.allocator, source_text, source_text.len);
+    defer analyzed.deinit(std.testing.allocator);
+
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+    try builder.append(std.testing.allocator, .{
+        .value = "my file",
+        .suffix = ",",
+        .removable_suffix = true,
+        .kind = .file,
+        .replace_start = analyzed.replace_start,
+        .replace_end = analyzed.replace_end,
+    });
+
+    var application = try applyBuiltCandidates(std.testing.allocator, source_text, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedProviderPathCompletion,
+    };
+    try std.testing.expectEqualStrings("'my file',", edit.replacement);
+    try std.testing.expectEqualStrings(",", edit.suffix.?);
+    try std.testing.expect(edit.removable_suffix);
 }

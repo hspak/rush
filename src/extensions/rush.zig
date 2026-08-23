@@ -53,7 +53,10 @@ pub const CompletionParsedOperand = struct {
 /// `rush_complete` until they are taken or the context is deinitialized.
 pub const CompletionContext = struct {
     allocator: std.mem.Allocator,
+    /// Quote-removed literal prefix when available; otherwise the raw prefix.
     prefix: []const u8,
+    /// Whether `prefix` began with an unquoted supported tilde form.
+    expand_leading_tilde: bool,
     replace_start: usize,
     replace_end: usize,
     argument_index: usize,
@@ -67,6 +70,7 @@ pub const CompletionContext = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         prefix: []const u8,
+        expand_leading_tilde: bool,
         replace_start: usize,
         replace_end: usize,
         argument_index: usize,
@@ -78,6 +82,7 @@ pub const CompletionContext = struct {
         return .{
             .allocator = allocator,
             .prefix = prefix,
+            .expand_leading_tilde = expand_leading_tilde,
             .replace_start = replace_start,
             .replace_end = replace_end,
             .argument_index = argument_index,
@@ -1374,11 +1379,10 @@ fn appendPathCompletionCandidates(context: *CompletionContext, sh: anytype, dire
     const entry_prefix = if (slash) |index| context.prefix[index + 1 ..] else context.prefix;
     // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
     const unexpanded_dir_path = if (dir_prefix.len == 0) "." else if (std.mem.eql(u8, dir_prefix, "/")) "/" else std.mem.trimEnd(u8, dir_prefix, "/");
-    const dir_path = try completion_path.expandLeadingTilde(
-        context.allocator,
-        unexpanded_dir_path,
-        shellValue(sh, "HOME"),
-    );
+    const dir_path = if (context.expand_leading_tilde)
+        try completion_path.expandLeadingTilde(context.allocator, unexpanded_dir_path, shellValue(sh, "HOME"))
+    else
+        try context.allocator.dupe(u8, unexpanded_dir_path);
     defer context.allocator.free(dir_path);
     var entries = sh.host.listDir(context.allocator, dir_path) catch return;
     defer entries.deinit();
@@ -1426,6 +1430,7 @@ test "rush_complete path provider leaves case-insensitive filtering to the match
     var context: CompletionContext = .init(
         std.testing.allocator,
         "agents",
+        false,
         0,
         "agents".len,
         0,
@@ -1448,6 +1453,59 @@ test "rush_complete path provider leaves case-insensitive filtering to the match
         context.prefix,
         .prefixOnly(),
     ).?);
+}
+
+test "rush_complete path provider expands only an eligible leading tilde" {
+    const TestState = struct {
+        const Self = @This();
+
+        fn getVariable(_: Self, name: []const u8) ?shell.state.Variable {
+            if (!std.mem.eql(u8, name, "HOME")) return null;
+            return .{ .name = "HOME", .value = "/home/alice" };
+        }
+    };
+    const TestHost = struct {
+        const Self = @This();
+
+        expected_path: []const u8,
+
+        pub fn listDir(self: *Self, allocator: std.mem.Allocator, path: []const u8) !host.ListDirResult {
+            try std.testing.expectEqualStrings(self.expected_path, path);
+            return .{ .allocator = allocator, .entries = try allocator.alloc(host.DirectoryEntry, 0) };
+        }
+    };
+    const TestShell = struct {
+        host: TestHost,
+        state: TestState,
+        env: []const [*:0]const u8 = &.{},
+    };
+    const Case = struct {
+        expand_leading_tilde: bool,
+        expected_path: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .expand_leading_tilde = true, .expected_path = "/home/alice" },
+        .{ .expand_leading_tilde = false, .expected_path = "~" },
+    };
+
+    for (cases) |case| {
+        var context: CompletionContext = .init(
+            std.testing.allocator,
+            "~/my",
+            case.expand_leading_tilde,
+            0,
+            "~/my".len,
+            0,
+            false,
+            "item",
+            &.{},
+            &.{},
+        );
+        defer context.deinit();
+        var sh: TestShell = .{ .host = .{ .expected_path = case.expected_path }, .state = .{} };
+
+        try appendPathCompletionCandidates(&context, &sh, false);
+    }
 }
 
 fn appendCompletionCandidate(

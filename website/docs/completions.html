@@ -52,6 +52,7 @@
     <dt><code>{ "builtin": "functions" }</code></dt><dd>Shell function-name completion, including <a href="configuration.html#autoloaded-functions">autoloadable functions</a> that have not been sourced yet.</dd>
     <dt><code>{ "function": "name" }</code></dt><dd>Run a Rush function in a hidden completion worker and collect candidates emitted by <code>rush_complete</code>.</dd>
   </dl>
+  <p>Path providers emit semantic path values rather than shell-escaped text. Rush protects shell syntax when inserting them, preserves one open single, double, or dollar-single quote at the start of the word, and uses canonical backslash escaping for mixed quoting. A completed file closes the preserved quote; a directory leaves it open for the next path segment.</p>
 
   <h2 id="dynamic-provider-functions"><a href="#dynamic-provider-functions">Dynamic provider functions</a></h2>
   <p>Reference a function from the manifest:</p>
