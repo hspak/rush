@@ -1,9 +1,10 @@
 //! Literal shell-word analysis and safe word spelling.
 //!
-//! Completion uses the real lexer and word parser to remove shell quoting from
-//! partially typed literal words. Dynamic expansions are deliberately rejected:
-//! their values are unavailable until evaluation and must not be mistaken for
-//! literal filesystem paths.
+//! Completion uses the real lexer and word parser to derive semantic values
+//! from partially typed literal words. Quote and escape syntax is discarded
+//! only for matching and lookup; insertion may restore and close a simple
+//! leading open quote. Dynamic expansions are deliberately rejected because
+//! their values are unavailable until evaluation.
 
 const std = @import("std");
 
@@ -19,8 +20,9 @@ pub const LiteralWord = struct {
     /// Whether the supported leading `~` or `~/` spelling is unquoted and may
     /// be expanded during filesystem lookup and later shell evaluation.
     expands_leading_tilde: bool,
-    /// The quote style to preserve when one pending quote begins the word.
-    /// Mixed quoting deliberately falls back to canonical escaping.
+    /// A pending quote style that can be restored when spelling a completion.
+    /// Only a quote beginning the word is preserved; mixed quoting deliberately
+    /// falls back to canonical escaping.
     open_quote: ?QuoteStyle,
 
     pub fn deinit(self: LiteralWord, allocator: std.mem.Allocator) void {
@@ -28,11 +30,10 @@ pub const LiteralWord = struct {
     }
 };
 
-/// Resolves quote removal and escape processing for a possibly incomplete
-/// literal shell word. Open single, double, and dollar-single quotes are closed
-/// synthetically before parsing. Returns null when the word contains parameter,
-/// command, arithmetic, or process substitution, or cannot otherwise be parsed
-/// as one literal word.
+/// Derives the semantic value of a possibly incomplete literal shell word.
+/// Pending single, double, and dollar-single quotes are closed only in temporary
+/// parser input and recorded in `open_quote` for later insertion. Returns null
+/// when evaluation would be required or the input is not one literal word.
 pub fn parseLiteralWord(
     allocator: std.mem.Allocator,
     raw: []const u8,
@@ -42,7 +43,7 @@ pub fn parseLiteralWord(
     const arena_allocator = arena.allocator();
 
     const pending_quote = try findPendingQuote(arena_allocator, raw);
-    const parse_text = try closePendingQuote(arena_allocator, raw, pending_quote);
+    const parse_text = try closePendingQuoteForParsing(arena_allocator, raw, pending_quote);
     const word = parser.parseWordExpansionText(arena_allocator, parse_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -104,7 +105,7 @@ fn findPendingQuote(allocator: std.mem.Allocator, raw: []const u8) error{OutOfMe
     return null;
 }
 
-fn closePendingQuote(
+fn closePendingQuoteForParsing(
     allocator: std.mem.Allocator,
     raw: []const u8,
     pending_quote: ?PendingQuote,
@@ -355,7 +356,7 @@ fn isSafeUnquotedByte(byte: u8) bool {
     };
 }
 
-test "literal word parsing follows shell quote removal" {
+test "literal word parsing derives semantic values from shell spelling" {
     const Case = struct {
         raw: []const u8,
         value: []const u8,
