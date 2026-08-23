@@ -53,7 +53,9 @@ pub const CompletionParsedOperand = struct {
 /// `rush_complete` until they are taken or the context is deinitialized.
 pub const CompletionContext = struct {
     allocator: std.mem.Allocator,
-    /// Quote-removed literal prefix when available; otherwise the raw prefix.
+    /// Semantic prefix after quote removal and escape processing when entirely
+    /// literal; otherwise the raw prefix. This is provider input, not the final
+    /// editor insertion spelling.
     prefix: []const u8,
     /// Whether `prefix` began with an unquoted supported tilde form.
     expand_leading_tilde: bool,
