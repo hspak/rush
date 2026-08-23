@@ -54,7 +54,7 @@
 
   <h2 id="context-variables"><a href="#context-variables">CONTEXT VARIABLES</a></h2>
   <dl>
-    <dt><code>rush_completion_prefix</code></dt><dd>The current token prefix that completion candidates should match.</dd>
+    <dt><code>rush_completion_prefix</code></dt><dd>The current token prefix that completion candidates should match. Rush removes shell quoting and escapes when the prefix is entirely literal; prefixes containing dynamic expansions remain in their raw form.</dd>
     <dt><code>rush_completion_argument_index</code></dt><dd>Zero-based positional argument index being completed.</dd>
     <dt><code>rush_completion_options_terminated</code></dt><dd><code>true</code> when <code>--</code> has been parsed, otherwise <code>false</code>.</dd>
     <dt><code>rush_completion_value_position</code></dt><dd><code>value</code> while completing an option value, otherwise <code>item</code>.</dd>
