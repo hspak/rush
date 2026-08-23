@@ -51,6 +51,18 @@ test "unavailable pipeline reports a shell error" {
     );
 }
 
+test "exec of an unavailable external command returns 127" {
+    const instance = c.rush_create() orelse return error.CreateFailed;
+    defer c.rush_destroy(instance);
+
+    const src = "exec definitely-not-an-embedded-builtin";
+    try std.testing.expectEqual(@as(u8, 127), c.rush_eval(instance, src.ptr, src.len));
+    try std.testing.expectEqualStrings(
+        "",
+        captured(c.rush_stderr_ptr(instance), c.rush_stderr_len(instance)),
+    );
+}
+
 test "finished session retains an EXIT trap failure status" {
     const instance = c.rush_create() orelse return error.CreateFailed;
     defer c.rush_destroy(instance);

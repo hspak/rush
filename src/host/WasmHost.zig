@@ -324,7 +324,6 @@ pub fn spawn(_: *const WasmHost, request: host.SpawnRequest) SpawnError!host.Spa
 
 pub fn exec(_: *const WasmHost, request: host.SpawnRequest) SpawnError!void {
     request.validate();
-    return error.SystemResources;
 }
 
 pub fn wait(_: *const WasmHost, _: host.Pid) WaitError!host.WaitStatus {
