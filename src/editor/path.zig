@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+const word_quoting = @import("../shell/word_quoting.zig");
+
 pub const Command = enum {
     list,
     complete,
@@ -95,6 +97,17 @@ pub fn replacementStyle(word: []const u8) ReplacementStyle {
     return .unquoted;
 }
 
+/// Escalates an unquoted replacement style to backslash escaping when any
+/// match would otherwise split into multiple shell words. Styles derived from
+/// quoted input keep their existing convention.
+pub fn effectiveReplacementStyle(style: ReplacementStyle, matches: []const []const u8) ReplacementStyle {
+    if (style != .unquoted) return style;
+    for (matches) |match| {
+        if (word_quoting.needsEscaping(match, .{})) return .backslash_escaped;
+    }
+    return .unquoted;
+}
+
 fn quoteMatches(allocator: std.mem.Allocator, matches: []const []const u8, style: ReplacementStyle) ![][]const u8 {
     const quoted = try allocator.alloc([]const u8, matches.len);
     errdefer allocator.free(quoted);
@@ -111,62 +124,9 @@ fn quoteMatches(allocator: std.mem.Allocator, matches: []const []const u8, style
 fn shellQuoteMatch(allocator: std.mem.Allocator, text: []const u8, style: ReplacementStyle) ![]const u8 {
     return switch (style) {
         .unquoted => allocator.dupe(u8, text),
-        .single_quoted => shellSingleQuote(allocator, text),
-        .double_quoted => shellDoubleQuote(allocator, text),
-        .backslash_escaped => shellBackslashEscape(allocator, text),
-    };
-}
-
-fn shellSingleQuote(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '\'');
-    for (text) |byte| {
-        if (byte == '\'') {
-            try out.appendSlice(allocator, "'\\''");
-        } else {
-            try out.append(allocator, byte);
-        }
-    }
-    try out.append(allocator, '\'');
-    return out.toOwnedSlice(allocator);
-}
-
-fn shellDoubleQuote(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '"');
-    for (text) |byte| {
-        switch (byte) {
-            '"', '\\', '$', '`' => {
-                try out.append(allocator, '\\');
-                try out.append(allocator, byte);
-            },
-            else => try out.append(allocator, byte),
-        }
-    }
-    try out.append(allocator, '"');
-    return out.toOwnedSlice(allocator);
-}
-
-fn shellBackslashEscape(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '\n') != null) return shellSingleQuote(allocator, text);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (text, 0..) |byte, index| {
-        if (!isSafeBackslashEscapedByte(byte) or (index == 0 and (byte == '~' or byte == '#'))) {
-            try out.append(allocator, '\\');
-        }
-        try out.append(allocator, byte);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn isSafeBackslashEscapedByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or switch (byte) {
-        '/', '.', '_', '-', '+', ',', ':', '@', '%', '=' => true,
-        else => false,
+        .single_quoted => word_quoting.singleQuote(allocator, text),
+        .double_quoted => word_quoting.doubleQuote(allocator, text),
+        .backslash_escaped => word_quoting.escape(allocator, text, .{}),
     };
 }
 
@@ -235,4 +195,22 @@ fn isAsciiWhitespace(byte: u8) bool {
         ' ', '\t', '\n', '\r' => true,
         else => false,
     };
+}
+
+test "effective replacement style escalates only from unquoted" {
+    const spacey_matches = [_][]const u8{"rush vi file"};
+    const safe_matches = [_][]const u8{"rush-vi-file"};
+
+    try std.testing.expectEqual(
+        ReplacementStyle.backslash_escaped,
+        effectiveReplacementStyle(.unquoted, &spacey_matches),
+    );
+    try std.testing.expectEqual(
+        ReplacementStyle.unquoted,
+        effectiveReplacementStyle(.unquoted, &safe_matches),
+    );
+    try std.testing.expectEqual(
+        ReplacementStyle.single_quoted,
+        effectiveReplacementStyle(.single_quoted, &spacey_matches),
+    );
 }

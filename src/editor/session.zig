@@ -873,15 +873,19 @@ pub const LineSession = struct {
     /// Borrows the request and matches for the duration of the call.
     pub fn applyPathExpansion(self: *LineSession, request: PathExpansionRequest, matches: PathExpansionMatches) !bool {
         if (request.command == .list or matches.items.len == 0) return false;
+        // Matches found on disk may need quoting even when the typed word was
+        // plain; an unquoted replacement containing spaces would split into
+        // several shell words.
+        const replacement_style = path.effectiveReplacementStyle(request.replacement_style, matches.items);
         const replacement = switch (request.command) {
             .list => unreachable,
             .complete => try pathExpansionCompletionReplacement(
                 self.allocator,
                 request.word,
                 matches.items,
-                request.replacement_style,
+                replacement_style,
             ),
-            .expand_all => try pathExpansionAllReplacement(self.allocator, matches.items, request.replacement_style),
+            .expand_all => try pathExpansionAllReplacement(self.allocator, matches.items, replacement_style),
         };
         defer self.allocator.free(replacement);
         if (std.mem.eql(u8, request.word, replacement)) return false;
@@ -4774,6 +4778,30 @@ test "vi pathname completion requotes replacements for quoted shell words" {
         .replacement_style = .double_quoted,
     }, .{ .items = &.{"rush vi dir/"} }));
     try std.testing.expectEqualStrings("cd \"rush vi dir/\"", dir.editor.buffer.text());
+}
+
+test "vi pathname completion escapes spacey matches for unquoted words" {
+    var file = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer file.deinit();
+    try file.editor.buffer.replace("cat rush");
+    try std.testing.expect(try file.applyPathExpansion(.{
+        .command = .complete,
+        .word = "rush",
+        .replace_start = "cat ".len,
+        .replace_end = "cat rush".len,
+    }, .{ .items = &.{"rush vi file"} }));
+    try std.testing.expectEqualStrings("cat rush\\ vi\\ file ", file.editor.buffer.text());
+
+    var all = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "$ " }, .{}, .vi);
+    defer all.deinit();
+    try all.editor.buffer.replace("printf rush*");
+    try std.testing.expect(try all.applyPathExpansion(.{
+        .command = .expand_all,
+        .word = "rush*",
+        .replace_start = "printf ".len,
+        .replace_end = "printf rush*".len,
+    }, .{ .items = &.{ "rush vi a", "rush vi b" } }));
+    try std.testing.expectEqualStrings("printf rush\\ vi\\ a rush\\ vi\\ b", all.editor.buffer.text());
 }
 
 test "vi pathname star expands all matches and listing formats matches" {
