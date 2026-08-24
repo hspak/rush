@@ -168,10 +168,41 @@
             \\    [![:digit:]]) printf '<%s>\n' not-digit ;;
             \\    *) printf '<%s>\n' bad ;;
             \\esac
+            \\case ' ' in
+            \\    [[:blank:]]) printf '<%s>\n' blank ;;
+            \\    *) printf '<%s>\n' bad ;;
+            \\esac
+            \\case "$(printf '\001')" in
+            \\    [[:cntrl:]]) printf '<%s>\n' cntrl ;;
+            \\    *) printf '<%s>\n' bad ;;
+            \\esac
+            \\case A in
+            \\    [[:graph:]]) printf '<%s>\n' graph ;;
+            \\    *) printf '<%s>\n' bad ;;
+            \\esac
+            \\case ' ' in
+            \\    [[:graph:]]) printf '<%s>\n' bad ;;
+            \\    [[:print:]]) printf '<%s>\n' print-not-graph ;;
+            \\    *) printf '<%s>\n' bad ;;
+            \\esac
+            \\case F in
+            \\    [[:xdigit:]]) printf '<%s>\n' xdigit ;;
+            \\    *) printf '<%s>\n' bad ;;
+            \\esac
+            \\case G in
+            \\    [[:xdigit:]]) printf '<%s>\n' bad ;;
+            \\    *) printf '<%s>\n' not-xdigit ;;
+            \\esac
             ,
             .stdout =
             \\<digit>
             \\<not-digit>
+            \\<blank>
+            \\<cntrl>
+            \\<graph>
+            \\<print-not-graph>
+            \\<xdigit>
+            \\<not-xdigit>
             \\
             ,
             .stderr = "",

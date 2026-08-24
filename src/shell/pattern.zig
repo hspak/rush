@@ -292,7 +292,11 @@ fn characterClassMatches(name: []const u8, character: []const u8) bool {
         .digit => category == .number_decimal_digit,
         .alpha => isCategoryLetter(category),
         .alnum => isCategoryLetter(category) or category == .number_decimal_digit,
+        .blank => codepoint == '\t' or category == .separator_space,
+        .cntrl => category == .other_control,
+        .graph => isPrintableCategory(category) and category != .separator_space,
         .lower => category == .letter_lowercase,
+        .print => isPrintableCategory(category),
         .upper => category == .letter_uppercase,
         .punct => switch (category) {
             .punctuation_connector,
@@ -313,17 +317,23 @@ fn characterClassMatches(name: []const u8, character: []const u8) bool {
             // ziglint-ignore: Z024 preserve existing readable expression shape; behavior-neutral extraction
             else => codepoint == '\t' or codepoint == '\n' or codepoint == '\r' or codepoint == 0x0b or codepoint == 0x0c,
         },
+        .xdigit => codepoint <= std.math.maxInt(u8) and std.ascii.isHex(@intCast(codepoint)),
     };
 }
 
 const CharacterClass = enum {
     alnum,
     alpha,
+    blank,
+    cntrl,
     digit,
+    graph,
     lower,
+    print,
     punct,
     space,
     upper,
+    xdigit,
 };
 
 fn isCategoryLetter(category: uucode.types.GeneralCategory) bool {
@@ -335,6 +345,20 @@ fn isCategoryLetter(category: uucode.types.GeneralCategory) bool {
         .letter_other,
         => true,
         else => false,
+    };
+}
+
+fn isPrintableCategory(category: uucode.types.GeneralCategory) bool {
+    return switch (category) {
+        .separator_line,
+        .separator_paragraph,
+        .other_control,
+        .other_format,
+        .other_surrogate,
+        .other_private_use,
+        .other_not_assigned,
+        => false,
+        else => true,
     };
 }
 
