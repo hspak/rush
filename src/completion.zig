@@ -307,8 +307,7 @@ fn applyBuiltCandidates(
     for (candidates) |*candidate| {
         try preparePathCandidateInsert(allocator, candidate, analyzed);
         const query = if (analyzed.literal_query) |literal|
-            if (candidateUsesLiteralQuery(candidate.*) and
-                candidate.replace_start == analyzed.replace_start and
+            if (candidate.replace_start == analyzed.replace_start and
                 candidate.replace_end == analyzed.replace_end)
                 literal.value
             else
@@ -320,11 +319,6 @@ fn applyBuiltCandidates(
         }
     }
     return editor_completion.applyCandidates(allocator, matches.items);
-}
-
-fn candidateUsesLiteralQuery(candidate: editor_completion.Candidate) bool {
-    return candidate.kind == .file or candidate.kind == .directory or
-        (candidate.kind == .command and candidate.insert != null);
 }
 
 fn preparePathCandidateInsert(
@@ -1926,6 +1920,30 @@ test "provider file candidates receive shell-safe inserts at the shared boundary
         else => return error.ExpectedProviderPathCompletion,
     };
     try std.testing.expectEqualStrings("my\\ file", edit.replacement);
+}
+
+test "literal provider prefixes match plain candidates by semantic value" {
+    const source_text = "tool 'ma";
+    const analyzed = try analyzeLine(std.testing.allocator, source_text, source_text.len);
+    defer analyzed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ma", analyzed.literal_prefix.?.value);
+
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+    try builder.append(std.testing.allocator, .{
+        .value = "main",
+        .kind = .plain,
+        .replace_start = analyzed.replace_start,
+        .replace_end = analyzed.replace_end,
+    });
+
+    var application = try applyBuiltCandidates(std.testing.allocator, source_text, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedProviderCompletion,
+    };
+    try std.testing.expectEqualStrings("main", edit.replacement);
 }
 
 test "provider-supplied inserts remain authoritative" {
