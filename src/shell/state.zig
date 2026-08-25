@@ -535,6 +535,7 @@ pub const State = struct {
                 binding.readonly = variable.readonly;
                 binding.integer = binding.integer or variable.integer;
                 self.clearFunctionAutoloadMissesIfSearchVariable(variable.name);
+                self.resetGetoptsCursorOnAssignment(variable.name);
                 return;
             },
             else => {},
@@ -552,6 +553,13 @@ pub const State = struct {
             .integer = variable.integer or (attributes != null and attributes.?.integer),
         });
         self.clearFunctionAutoloadMissesIfSearchVariable(owned_name);
+        self.resetGetoptsCursorOnAssignment(owned_name);
+    }
+
+    fn resetGetoptsCursorOnAssignment(self: *State, name: []const u8) void {
+        // Assigning OPTIND=1 is the POSIX mechanism for starting a new parse,
+        // including when the previous parse stopped within an option cluster.
+        if (std.mem.eql(u8, name, "OPTIND")) self.getopts_char_index = 1;
     }
 
     pub fn removeVariable(self: *State, name: []const u8) void {

@@ -734,6 +734,8 @@ fn getoptsOptind(shell: anytype) usize {
 
 fn putGetoptsOptind(shell: anytype, optind: usize) !void {
     const value = try std.fmt.allocPrint(shell.scratchAllocator(), "{}", .{optind});
+    const char_index = shell.state.getopts_char_index;
+    defer shell.state.getopts_char_index = char_index;
     try shell.state.putVariable(.{ .name = "OPTIND", .value = value });
 }
 

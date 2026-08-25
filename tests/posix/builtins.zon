@@ -776,6 +776,23 @@
             .status = 0,
         },
         .{
+            .name = "setting OPTIND to one restarts clustered option parsing",
+            .script =
+            \\getopts ab opt -ab
+            \\printf '<%s>\n' "$opt"
+            \\OPTIND=1
+            \\getopts cd opt -cd
+            \\printf '<%s>\n' "$opt"
+            ,
+            .stdout =
+            \\<a>
+            \\<c>
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
             .name = "kill -s 0 probes the current shell process",
             .script =
             \\kill -s 0 $$
