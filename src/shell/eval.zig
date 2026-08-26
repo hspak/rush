@@ -4403,7 +4403,12 @@ fn evalExecBuiltin(shell: anytype, args: []const []const u8, assignments: []cons
 
 const SavedVariable = struct {
     name: []const u8,
-    variable: ?state_mod.Variable,
+    value: union(enum) {
+        missing,
+        scalar: state_mod.Variable,
+        array: state_mod.ArrayVariable,
+        attributes: state_mod.VariableAttributes,
+    },
 };
 
 fn evalFunction(
@@ -4462,15 +4467,44 @@ fn pushFunctionLocalFrame(shell: anytype, assignments: []const ast.Assignment) !
 fn saveAssignmentVariables(shell: anytype, assignments: []const ast.Assignment) ![]const SavedVariable {
     const saved = try shell.scratchAllocator().alloc(SavedVariable, assignments.len);
     for (assignments, 0..) |assignment, index| {
-        const variable = if (shell.state.getVariable(assignment.name)) |existing| state_mod.Variable{
-            .name = try shell.scratchAllocator().dupe(u8, existing.name),
-            .value = try shell.scratchAllocator().dupe(u8, existing.value),
-            .exported = existing.exported,
-            .readonly = existing.readonly,
-        } else null;
         saved[index] = .{
             .name = assignment.name,
-            .variable = variable,
+            .value = if (shell.state.getVariable(assignment.name)) |variable|
+                .{ .scalar = .{
+                    .name = assignment.name,
+                    .value = try shell.scratchAllocator().dupe(u8, variable.value),
+                    .exported = variable.exported,
+                    .readonly = variable.readonly,
+                    .integer = variable.integer,
+                } }
+            else if (shell.state.getArray(assignment.name)) |array|
+                .{ .array = .{
+                    .name = assignment.name,
+                    .elements = try saveArrayElements(shell, array.elements),
+                    .exported = array.exported,
+                    .readonly = array.readonly,
+                    .integer = array.integer,
+                } }
+            else if (shell.state.getVariableAttributes(assignment.name)) |attributes|
+                .{ .attributes = .{
+                    .name = assignment.name,
+                    .exported = attributes.exported,
+                    .readonly = attributes.readonly,
+                    .integer = attributes.integer,
+                } }
+            else
+                .missing,
+        };
+    }
+    return saved;
+}
+
+fn saveArrayElements(shell: anytype, elements: []const state_mod.ArrayElement) ![]state_mod.ArrayElement {
+    const saved = try shell.scratchAllocator().alloc(state_mod.ArrayElement, elements.len);
+    for (elements, 0..) |element, index| {
+        saved[index] = .{
+            .index = element.index,
+            .value = try shell.scratchAllocator().dupe(u8, element.value),
         };
     }
     return saved;
@@ -4481,11 +4515,27 @@ fn restoreVariables(shell: anytype, saved: []const SavedVariable) void {
     while (index != 0) {
         index -= 1;
         const entry = saved[index];
-        if (entry.variable) |variable| {
-            // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
-            shell.state.putVariable(variable) catch {};
-        } else {
-            shell.state.removeVariable(entry.name);
+        switch (entry.value) {
+            .missing => shell.state.removeVariable(entry.name),
+            .scalar => |variable| {
+                // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+                shell.state.putVariable(variable) catch {};
+            },
+            .array => |array| {
+                shell.state.removeVariable(entry.name);
+                const attributes: state_mod.ArrayAttributes = .{
+                    .exported = array.exported,
+                    .readonly = array.readonly,
+                    .integer = array.integer,
+                };
+                // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+                shell.state.putArrayElementsWithAttributes(array.name, array.elements, attributes) catch {};
+            },
+            .attributes => |attributes| {
+                shell.state.removeVariable(entry.name);
+                // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+                shell.state.putVariableAttributes(attributes) catch {};
+            },
         }
     }
 }

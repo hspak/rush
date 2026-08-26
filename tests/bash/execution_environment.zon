@@ -154,6 +154,25 @@
             .status = 0,
         },
         .{
+            .name = "temporary compound array assignments restore the previous array",
+            .script =
+            \\arr=([2]=two [7]=seven)
+            \\arr=(temporary) printf 'command ran\n'
+            \\printf 'indices=<%s>\n' "${!arr[@]}"
+            \\printf 'values=<%s>\n' "${arr[@]}"
+            ,
+            .stdout =
+            \\command ran
+            \\indices=<2>
+            \\indices=<7>
+            \\values=<two>
+            \\values=<seven>
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
             .name = "unset removes indexed arrays and elements",
             .script =
             \\arr=(a b c)
