@@ -84,7 +84,7 @@ pub fn semanticContext(
         .operand_index = operand_index,
         .options_terminated = options_terminated,
         .complete_options = prefix_is_option,
-        .complete_subcommands = operand_index == 0 and commandHasSubcommands(command),
+        .complete_subcommands = operand_index == 0 and commandHasSubcommandCandidates(command),
     };
 }
 
@@ -226,9 +226,12 @@ fn optionMatchesSpelling(option: std.json.Value, spelling: []const u8) bool {
     return false;
 }
 
-fn commandHasSubcommands(command: std.json.Value) bool {
-    const subcommands = jsonArrayField(command, "subcommands") orelse return false;
-    return subcommands.items.len != 0;
+fn commandHasSubcommandCandidates(command: std.json.Value) bool {
+    if (jsonArrayField(command, "subcommands")) |subcommands| {
+        if (subcommands.items.len != 0) return true;
+    }
+    const dynamic = jsonArrayField(command, "dynamicSubcommands") orelse return false;
+    return dynamic.items.len != 0;
 }
 
 fn wordMatchesCommandName(command: std.json.Value, name: []const u8) bool {

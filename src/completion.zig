@@ -432,6 +432,23 @@ fn completeFromManifest(
     if (semantic.complete_subcommands) {
         // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
         try appendSubcommandCandidates(allocator, builder, current, providers, analyzed.replace_start, analyzed.replace_end);
+        if (jsonArrayField(current, "dynamicSubcommands")) |provider_refs| {
+            for (provider_refs.items) |provider_ref| {
+                try appendProviderCandidates(
+                    allocator,
+                    io,
+                    sh,
+                    builder,
+                    analyzed,
+                    semantic,
+                    command,
+                    current,
+                    providers,
+                    provider_ref,
+                    companion_path,
+                );
+            }
+        }
         return true;
     }
 
@@ -1340,6 +1357,59 @@ test "completion loads manifest subcommands" {
         if (std.mem.eql(u8, candidate.value, "build")) return;
     }
     return error.ExpectedZigBuildCandidate;
+}
+
+test "completion loads dynamic subcommands from manifest providers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fmt.allocPrint(allocator, "rush-test-completion-{d}", .{std.c.getpid()});
+    defer allocator.free(root);
+    // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const completions_dir = try std.fs.path.join(allocator, &.{ root, "rush", "completions" });
+    defer allocator.free(completions_dir);
+    try std.Io.Dir.cwd().createDirPath(io, completions_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ completions_dir, "rush-test-dynamic.json" });
+    defer allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = manifest_path,
+        .data =
+        \\{
+        \\  "manifestVersion": 1,
+        \\  "command": {
+        \\    "name": "rush-test-dynamic",
+        \\    "providers": {
+        \\      "commands": { "values": [
+        \\        { "value": "generated", "description": "dynamic command" }
+        \\      ] }
+        \\    },
+        \\    "dynamicSubcommands": ["commands"]
+        \\  }
+        \\}
+        ,
+    });
+
+    var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(allocator, .{}, .{});
+    defer sh.deinit();
+    try sh.state.putVariable(.{ .name = "XDG_DATA_HOME", .value = root });
+
+    const source = "rush-test-dynamic ";
+    var application = try complete(&sh, allocator, io, source, source.len);
+    defer application.deinit(allocator);
+    const candidates = switch (application) {
+        .edit => |edit| {
+            try std.testing.expectEqualStrings("generated", edit.replacement);
+            return;
+        },
+        .ambiguous => |candidates| candidates,
+        else => return error.ExpectedDynamicSubcommandCandidate,
+    };
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.value, "generated")) return;
+    }
+    return error.ExpectedDynamicSubcommandCandidate;
 }
 
 test "completion includes dynamic option provider candidates" {
