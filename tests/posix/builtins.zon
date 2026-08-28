@@ -579,6 +579,21 @@
             .status = 0,
         },
         .{
+            .name = "regular builtin sees assignment prefixes",
+            .script =
+            \\HOME=original
+            \\mkdir assigned-home
+            \\HOME=assigned-home cd
+            \\printf '<%s>:<%s>\n' "${PWD##*/}" "$HOME"
+            ,
+            .stdout =
+            \\<assigned-home>:<original>
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
             .name = "command -v writes a found utility name",
             .script =
             \\command -v cd

@@ -1834,21 +1834,26 @@ fn evalSimpleScoped(shell: anytype, command: ast.SimpleCommand) EvalError!result
         if (shell.state.getFunction(name)) |function| return evalFunction(shell, function, command.assignments, fields[1..]);
     }
     if (builtin_definition) |definition| {
+        if (definition.id == .command) {
+            return evalCommandBuiltin(shell, fields, command.assignments, &redirections, &restore_redirections);
+        }
+        if (definition.id == .env) return evalEnvBuiltin(shell, fields, command.assignments);
+        if (definition.id == .read) return evalReadBuiltin(shell, fields, command.assignments);
+        if (definition.id == .test_ or definition.id == .bracket) {
+            return evalTestBuiltin(shell, fields, command.assignments);
+        }
+
+        const saved_assignments = try saveAssignmentVariables(shell, command.assignments);
+        defer restoreVariables(shell, saved_assignments);
+        try applyExportedAssignments(shell, command.assignments);
+
         if (definition.id == .declare or definition.id == .typeset) {
             return evalDeclarationBuiltin(shell, definition.id, command.words[1..]);
         }
         if (definition.id == .cd) return evalCdBuiltin(shell, fields);
         if (definition.id == .z) return evalZBuiltin(shell, fields);
-        if (definition.id == .command) {
-            return evalCommandBuiltin(shell, fields, command.assignments, &redirections, &restore_redirections);
-        }
         if (definition.id == .source) return evalDotBuiltin(shell, fields);
-        if (definition.id == .env) return evalEnvBuiltin(shell, fields, command.assignments);
         if (definition.id == .pwd) return evalPwdBuiltin(shell, fields);
-        if (definition.id == .read) return evalReadBuiltin(shell, fields, command.assignments);
-        if (definition.id == .test_ or definition.id == .bracket) {
-            return evalTestBuiltin(shell, fields, command.assignments);
-        }
         if (definition.id == .type) return evalTypeBuiltin(shell, fields);
         if (definition.id == .wait) return evalWaitBuiltin(shell, fields);
         return (try builtin.tryEval(shell, definition, fields)) orelse unreachable;
