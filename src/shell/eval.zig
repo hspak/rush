@@ -2068,7 +2068,10 @@ fn changeDirectoryBuiltin(
     // POSIX cd -L canonicalizes curpath, then chdir()s that path. Using the
     // original operand would make `cd ..` follow the physical parent of a
     // symlink while $PWD moved to the logical parent.
-    var new_pwd = if (physical) target else try logicalPath(allocator, old_pwd, target);
+    var new_pwd = if (physical)
+        target
+    else
+        try logicalCdPath(shell, builtin_name, old_pwd, target) orelse return .{ .status = 1 };
     shell.host.changeDir(new_pwd) catch |err| {
         target = if (allow_suggestion)
             try cdSuggestionRecoveryTarget(shell, builtin_name, target, err) orelse return .{ .status = 1 }
@@ -2076,7 +2079,10 @@ fn changeDirectoryBuiltin(
             try writeCdFailureDiagnostic(shell, builtin_name, target, err, null, .line);
             return .{ .status = 1 };
         };
-        new_pwd = if (physical) target else try logicalPath(allocator, old_pwd, target);
+        new_pwd = if (physical)
+            target
+        else
+            try logicalCdPath(shell, builtin_name, old_pwd, target) orelse return .{ .status = 1 };
         shell.host.changeDir(new_pwd) catch |recovery_err| {
             try writeCdFailureDiagnostic(shell, builtin_name, target, recovery_err, null, .line);
             return .{ .status = 1 };
@@ -3547,34 +3553,55 @@ fn startsWithDotPathComponent(path: []const u8) bool {
         std.mem.startsWith(u8, path, "./") or std.mem.startsWith(u8, path, "../");
 }
 
-fn logicalPath(allocator: std.mem.Allocator, old_pwd: []const u8, target: []const u8) ![]const u8 {
+fn logicalCdPath(shell: anytype, builtin_name: []const u8, old_pwd: []const u8, target: []const u8) !?[]const u8 {
+    return logicalPath(shell, old_pwd, target) catch |err| switch (err) {
+        error.NotDir => {
+            try writeCdFailureDiagnostic(shell, builtin_name, target, err, null, .line);
+            return null;
+        },
+        else => return err,
+    };
+}
+
+fn logicalPath(shell: anytype, old_pwd: []const u8, target: []const u8) ![]const u8 {
+    const allocator = shell.scratchAllocator();
     var combined: []const u8 = target;
     if (target.len == 0 or target[0] != '/') {
         combined = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ old_pwd, target });
     }
-    return normalizeAbsolutePath(allocator, combined);
+    return normalizeAbsolutePath(shell, combined);
 }
 
-fn normalizeAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+fn normalizeAbsolutePath(shell: anytype, path: []const u8) ![]const u8 {
     // ziglint-ignore: Z016 compound assert documents a single invariant; preserve readability
     std.debug.assert(path.len != 0 and path[0] == '/');
+    const allocator = shell.scratchAllocator();
     var components: std.ArrayList([]const u8) = .empty;
     var iterator = std.mem.splitScalar(u8, path, '/');
     while (iterator.next()) |component| {
         if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
         if (std.mem.eql(u8, component, "..")) {
-            if (components.items.len != 0) components.items.len -= 1;
+            if (components.items.len != 0) {
+                const preceding_path = try absolutePathFromComponents(allocator, components.items);
+                const status = try fileStatus(shell, preceding_path, true) orelse return error.NotDir;
+                if (status.kind != .directory) return error.NotDir;
+                components.items.len -= 1;
+            }
             continue;
         }
         try components.append(allocator, component);
     }
-    if (components.items.len == 0) return allocator.dupe(u8, "/");
+    return absolutePathFromComponents(allocator, components.items);
+}
+
+fn absolutePathFromComponents(allocator: std.mem.Allocator, components: []const []const u8) ![]const u8 {
+    if (components.len == 0) return allocator.dupe(u8, "/");
 
     var total_len: usize = 0;
-    for (components.items) |component| total_len += component.len + 1;
+    for (components) |component| total_len += component.len + 1;
     const normalized = try allocator.alloc(u8, total_len);
     var cursor: usize = 0;
-    for (components.items) |component| {
+    for (components) |component| {
         normalized[cursor] = '/';
         cursor += 1;
         @memcpy(normalized[cursor..][0..component.len], component);
@@ -3583,7 +3610,7 @@ fn normalizeAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]cons
     return normalized;
 }
 
-test "logical cd chdirs the canonicalized path rather than the operand" {
+test "logical cd validates and chdirs the canonicalized path" {
     const TestHost = struct {
         const Self = @This();
 
@@ -3601,6 +3628,13 @@ test "logical cd chdirs the canonicalized path rather than the operand" {
 
         fn changeDir(self: *Self, target: []const u8) !void {
             self.last_target = target;
+        }
+
+        fn fileTestStatusZ(_: *Self, path: [:0]const u8, follow_symlinks: bool) ?host_mod.FileStatus {
+            std.testing.expect(follow_symlinks) catch unreachable;
+            if (std.mem.eql(u8, path, "/logical/link")) return .{ .kind = .directory };
+            if (std.mem.eql(u8, path, "/logical/file")) return .{ .kind = .file };
+            return null;
         }
 
         fn currentParentProcessId(_: *Self) host_mod.Pid {
@@ -3642,6 +3676,16 @@ test "logical cd chdirs the canonicalized path rather than the operand" {
     try std.testing.expectEqualStrings("/logical", shell.host.last_target);
     try std.testing.expectEqualStrings("/logical", shell.state.getVariable("PWD").?.value);
     try std.testing.expectEqualStrings("/logical/link", shell.state.getVariable("OLDPWD").?.value);
+
+    try shell.state.putVariable(.{ .name = "PWD", .value = "/logical/file", .exported = true });
+    shell.host.last_target = "";
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 1),
+        (try changeDirectoryBuiltin(&shell, "cd", "..", false, false, false)).status,
+    );
+    try std.testing.expectEqualStrings("", shell.host.last_target);
+    try std.testing.expectEqualStrings("/logical/file", shell.state.getVariable("PWD").?.value);
+    try std.testing.expectEqualStrings("cd: ..: not a directory\n", shell.host.stderr.items);
 }
 
 fn staticDeclarationBuiltinName(shell: anytype, word: ast.Word) !?builtin.Id {
@@ -8893,6 +8937,10 @@ test "z builtin jumps through directory history" {
         fn changeDir(self: *Self, target: []const u8) !void {
             if (!std.mem.eql(u8, target, "/repo/project")) return error.FileNotFound;
             self.cwd = "/repo/project";
+        }
+
+        fn fileTestStatusZ(_: *Self, _: [:0]const u8, _: bool) ?host_mod.FileStatus {
+            unreachable;
         }
 
         fn currentParentProcessId(_: *Self) host_mod.Pid {
