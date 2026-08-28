@@ -1392,7 +1392,14 @@ fn appendPathCompletionCandidates(context: *CompletionContext, sh: anytype, dire
     for (entries.entries) |entry| {
         if (entry.name.len == 0 or std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
         if (!include_hidden and entry.name[0] == '.') continue;
-        const is_directory = entry.kind == .directory;
+        const is_directory = try completion_path.pathCandidateIsDirectory(
+            context.allocator,
+            sh,
+            dir_prefix,
+            context.expand_leading_tilde,
+            shellValue(sh, "HOME"),
+            entry,
+        );
         if (directories_only and !is_directory) continue;
         const value = if (is_directory)
             try std.fmt.allocPrint(context.allocator, "{s}{s}/", .{ dir_prefix, entry.name })
@@ -1421,6 +1428,10 @@ test "rush_complete path provider leaves case-insensitive filtering to the match
             errdefer allocator.free(entries);
             entries[0] = .{ .name = try allocator.dupe(u8, "AGENTS.md"), .kind = .file };
             return .{ .allocator = allocator, .entries = entries };
+        }
+
+        pub fn fileTestStatusZ(_: *Self, _: [:0]const u8, _: bool) ?host.FileStatus {
+            unreachable;
         }
     };
     const TestShell = struct {
@@ -1475,6 +1486,10 @@ test "rush_complete path provider expands only an eligible leading tilde" {
             try std.testing.expectEqualStrings(self.expected_path, path);
             return .{ .allocator = allocator, .entries = try allocator.alloc(host.DirectoryEntry, 0) };
         }
+
+        pub fn fileTestStatusZ(_: *Self, _: [:0]const u8, _: bool) ?host.FileStatus {
+            unreachable;
+        }
     };
     const TestShell = struct {
         host: TestHost,
@@ -1508,6 +1523,102 @@ test "rush_complete path provider expands only an eligible leading tilde" {
 
         try appendPathCompletionCandidates(&context, &sh, false);
     }
+}
+
+test "rush_complete path provider follows symlink directories" {
+    const TestState = struct {
+        const Self = @This();
+
+        fn getVariable(_: Self, _: []const u8) ?shell.state.Variable {
+            return null;
+        }
+    };
+    const TestHost = struct {
+        const Self = @This();
+
+        pub fn listDir(_: *Self, allocator: std.mem.Allocator, path: []const u8) !host.ListDirResult {
+            try std.testing.expectEqualStrings(".", path);
+            const entries = try allocator.alloc(host.DirectoryEntry, 4);
+            errdefer allocator.free(entries);
+            entries[0] = .{ .name = try allocator.dupe(u8, "linkdir"), .kind = .symlink };
+            entries[1] = .{ .name = try allocator.dupe(u8, "linkfile"), .kind = .symlink };
+            entries[2] = .{ .name = try allocator.dupe(u8, "broken"), .kind = .symlink };
+            entries[3] = .{ .name = try allocator.dupe(u8, "realdir"), .kind = .directory };
+            return .{ .allocator = allocator, .entries = entries };
+        }
+
+        pub fn fileTestStatusZ(_: *Self, path: [:0]const u8, follow_symlinks: bool) ?host.FileStatus {
+            std.testing.expect(follow_symlinks) catch unreachable;
+            if (std.mem.eql(u8, path, "linkdir")) return .{ .kind = .directory };
+            if (std.mem.eql(u8, path, "linkfile")) return .{ .kind = .file };
+            return null;
+        }
+    };
+    const TestShell = struct {
+        host: TestHost,
+        state: TestState,
+        env: []const [*:0]const u8 = &.{},
+    };
+
+    var files_context: CompletionContext = .init(
+        std.testing.allocator,
+        "link",
+        false,
+        0,
+        "link".len,
+        0,
+        false,
+        "item",
+        &.{},
+        &.{},
+    );
+    defer files_context.deinit();
+    var sh: TestShell = .{ .host = .{}, .state = .{} };
+    try appendPathCompletionCandidates(&files_context, &sh, false);
+    const file_candidates = try files_context.takeCandidates();
+    defer completion.freeCandidates(std.testing.allocator, file_candidates);
+
+    try std.testing.expectEqual(@as(usize, 4), file_candidates.len);
+    try expectPathCandidate(file_candidates, "linkdir/", .directory, false);
+    try expectPathCandidate(file_candidates, "linkfile", .file, true);
+    try expectPathCandidate(file_candidates, "broken", .file, true);
+    try expectPathCandidate(file_candidates, "realdir/", .directory, false);
+
+    var dirs_context: CompletionContext = .init(
+        std.testing.allocator,
+        "link",
+        false,
+        0,
+        "link".len,
+        0,
+        false,
+        "item",
+        &.{},
+        &.{},
+    );
+    defer dirs_context.deinit();
+    try appendPathCompletionCandidates(&dirs_context, &sh, true);
+    const dir_candidates = try dirs_context.takeCandidates();
+    defer completion.freeCandidates(std.testing.allocator, dir_candidates);
+
+    try std.testing.expectEqual(@as(usize, 2), dir_candidates.len);
+    try expectPathCandidate(dir_candidates, "linkdir/", .directory, false);
+    try expectPathCandidate(dir_candidates, "realdir/", .directory, false);
+}
+
+fn expectPathCandidate(
+    candidates: []const completion.Candidate,
+    value: []const u8,
+    kind: completion.Kind,
+    append_space: bool,
+) !void {
+    for (candidates) |candidate| {
+        if (!std.mem.eql(u8, candidate.value, value)) continue;
+        try std.testing.expectEqual(kind, candidate.kind);
+        try std.testing.expectEqual(append_space, candidate.append_space);
+        return;
+    }
+    return error.ExpectedPathCandidate;
 }
 
 fn appendCompletionCandidate(

@@ -1102,7 +1102,14 @@ fn appendPathCandidates(
     for (entries.entries) |entry| {
         if (entry.name.len == 0 or std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
         if (!include_hidden and entry.name[0] == '.') continue;
-        const is_directory = try pathCandidateIsDirectory(allocator, sh, dir_prefix, expand_leading_tilde, entry);
+        const is_directory = try completion_path.pathCandidateIsDirectory(
+            allocator,
+            sh,
+            dir_prefix,
+            expand_leading_tilde,
+            shellValue(sh, "HOME"),
+            entry,
+        );
         if (directories_only and !is_directory) continue;
         const value = if (is_directory)
             try std.fmt.allocPrint(allocator, "{s}{s}/", .{ dir_prefix, entry.name })
@@ -1112,29 +1119,6 @@ fn appendPathCandidates(
         // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
         try builder.append(allocator, .{ .value = value, .display = entry.name, .kind = if (is_directory) .directory else .file, .replace_start = replace_start, .replace_end = replace_end, .append_space = !is_directory });
     }
-}
-
-fn pathCandidateIsDirectory(
-    allocator: std.mem.Allocator,
-    sh: anytype,
-    dir_prefix: []const u8,
-    expand_leading_tilde: bool,
-    entry: host.DirectoryEntry,
-) !bool {
-    if (entry.kind == .directory) return true;
-    if (entry.kind != .symlink and entry.kind != .other) return false;
-
-    const unexpanded_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_prefix, entry.name });
-    defer allocator.free(unexpanded_path);
-    const path = if (expand_leading_tilde)
-        try completion_path.expandLeadingTilde(allocator, unexpanded_path, shellValue(sh, "HOME"))
-    else
-        try allocator.dupe(u8, unexpanded_path);
-    defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    const status = sh.host.fileTestStatusZ(path_z, true) orelse return false;
-    return status.kind == .directory;
 }
 
 fn shellValue(sh: anytype, name: []const u8) ?[]const u8 {
@@ -1588,6 +1572,129 @@ test "path completion follows symlinked directories before appending space" {
         else => return error.ExpectedSingleSymlinkDirectoryCompletion,
     };
     try std.testing.expectEqualStrings(".config/rush/", edit.replacement);
+    try std.testing.expect(!edit.append_space);
+}
+
+test "path completion treats file and broken symlinks as files" {
+    const TestState = struct {
+        const Self = @This();
+
+        fn getVariable(_: Self, _: []const u8) ?shell.state.Variable {
+            return null;
+        }
+    };
+    const TestHost = struct {
+        const Self = @This();
+
+        pub fn listDir(_: *Self, allocator: std.mem.Allocator, path: []const u8) !host.ListDirResult {
+            try std.testing.expectEqualStrings(".", path);
+            const entries = try allocator.alloc(host.DirectoryEntry, 2);
+            errdefer allocator.free(entries);
+            entries[0] = .{ .name = try allocator.dupe(u8, "linkfile"), .kind = .symlink };
+            entries[1] = .{ .name = try allocator.dupe(u8, "broken"), .kind = .symlink };
+            return .{ .allocator = allocator, .entries = entries };
+        }
+
+        pub fn fileTestStatusZ(_: *Self, path: [:0]const u8, follow_symlinks: bool) ?host.FileStatus {
+            std.testing.expect(follow_symlinks) catch unreachable;
+            if (std.mem.eql(u8, path, "linkfile")) return .{ .kind = .file };
+            return null;
+        }
+    };
+    const TestShell = struct {
+        host: TestHost,
+        state: TestState,
+        env: []const [*:0]const u8 = &.{},
+    };
+
+    const source = "cat linkf";
+    const analyzed = try analyzeLine(std.testing.allocator, source, source.len);
+    defer analyzed.deinit(std.testing.allocator);
+    const literal = analyzed.literal_prefix orelse return error.ExpectedLiteralPath;
+    var sh: TestShell = .{ .host = .{}, .state = .{} };
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+
+    try appendPathCandidates(
+        std.testing.allocator,
+        &builder,
+        &sh,
+        literal.value,
+        literal.expands_leading_tilde,
+        analyzed.replace_start,
+        analyzed.replace_end,
+        false,
+    );
+    var application = try applyBuiltCandidates(std.testing.allocator, source, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedSingleFileSymlinkCompletion,
+    };
+    try std.testing.expectEqualStrings("linkfile", edit.replacement);
+    try std.testing.expect(edit.append_space);
+}
+
+test "directory-only path completion includes symlink directories" {
+    const TestState = struct {
+        const Self = @This();
+
+        fn getVariable(_: Self, _: []const u8) ?shell.state.Variable {
+            return null;
+        }
+    };
+    const TestHost = struct {
+        const Self = @This();
+
+        pub fn listDir(_: *Self, allocator: std.mem.Allocator, path: []const u8) !host.ListDirResult {
+            try std.testing.expectEqualStrings(".", path);
+            const entries = try allocator.alloc(host.DirectoryEntry, 2);
+            errdefer allocator.free(entries);
+            entries[0] = .{ .name = try allocator.dupe(u8, "linkdir"), .kind = .symlink };
+            entries[1] = .{ .name = try allocator.dupe(u8, "linkfile"), .kind = .symlink };
+            return .{ .allocator = allocator, .entries = entries };
+        }
+
+        pub fn fileTestStatusZ(_: *Self, path: [:0]const u8, follow_symlinks: bool) ?host.FileStatus {
+            std.testing.expect(follow_symlinks) catch unreachable;
+            if (std.mem.eql(u8, path, "linkdir")) return .{ .kind = .directory };
+            if (std.mem.eql(u8, path, "linkfile")) return .{ .kind = .file };
+            return null;
+        }
+    };
+    const TestShell = struct {
+        host: TestHost,
+        state: TestState,
+        env: []const [*:0]const u8 = &.{},
+    };
+
+    const source = "cd link";
+    const analyzed = try analyzeLine(std.testing.allocator, source, source.len);
+    defer analyzed.deinit(std.testing.allocator);
+    const literal = analyzed.literal_prefix orelse return error.ExpectedLiteralPath;
+    var sh: TestShell = .{ .host = .{}, .state = .{} };
+    var builder: Builder = .{};
+    defer builder.deinit(std.testing.allocator);
+
+    try appendPathCandidates(
+        std.testing.allocator,
+        &builder,
+        &sh,
+        literal.value,
+        literal.expands_leading_tilde,
+        analyzed.replace_start,
+        analyzed.replace_end,
+        true,
+    );
+    var application = try applyBuiltCandidates(std.testing.allocator, source, &builder, analyzed);
+    defer application.deinit(std.testing.allocator);
+
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedSingleSymlinkDirectoryCompletion,
+    };
+    try std.testing.expectEqualStrings("linkdir/", edit.replacement);
     try std.testing.expect(!edit.append_space);
 }
 

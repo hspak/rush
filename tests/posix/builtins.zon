@@ -184,6 +184,23 @@
             .status = 0,
         },
         .{
+            .name = "cd -L leaves a symlink through the logical parent",
+            .script =
+            \\mkdir real logical
+            \\ln -s "$PWD/real" logical/link
+            \\cd logical/link
+            \\cd ..
+            \\physical=$(pwd -P)
+            \\printf '<%s>:<%s>\n' "${PWD##*/}" "${physical##*/}"
+            ,
+            .stdout =
+            \\<logical>:<logical>
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
             .name = "read with -r preserves backslash characters",
             .script =
             \\printf 'a b\\c\n' | { read -r first rest; printf '<%s>:<%s>\n' "$first" "$rest"; }

@@ -2065,19 +2065,24 @@ fn changeDirectoryBuiltin(
     const allocator = shell.scratchAllocator();
     const old_pwd = try currentLogicalDir(shell);
     var target = initial_target;
-    shell.host.changeDir(target) catch |err| {
+    // POSIX cd -L canonicalizes curpath, then chdir()s that path. Using the
+    // original operand would make `cd ..` follow the physical parent of a
+    // symlink while $PWD moved to the logical parent.
+    var new_pwd = if (physical) target else try logicalPath(allocator, old_pwd, target);
+    shell.host.changeDir(new_pwd) catch |err| {
         target = if (allow_suggestion)
             try cdSuggestionRecoveryTarget(shell, builtin_name, target, err) orelse return .{ .status = 1 }
         else {
             try writeCdFailureDiagnostic(shell, builtin_name, target, err, null, .line);
             return .{ .status = 1 };
         };
-        shell.host.changeDir(target) catch |recovery_err| {
+        new_pwd = if (physical) target else try logicalPath(allocator, old_pwd, target);
+        shell.host.changeDir(new_pwd) catch |recovery_err| {
             try writeCdFailureDiagnostic(shell, builtin_name, target, recovery_err, null, .line);
             return .{ .status = 1 };
         };
     };
-    const new_pwd = if (physical) try shell.host.currentDir(allocator) else try logicalPath(allocator, old_pwd, target);
+    if (physical) new_pwd = try shell.host.currentDir(allocator);
     shell.state.putVariable(.{ .name = "OLDPWD", .value = old_pwd, .exported = exportedFlag(shell, "OLDPWD") }) catch {
         return .{ .status = 1 };
     };
@@ -3576,6 +3581,67 @@ fn normalizeAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]cons
         cursor += component.len;
     }
     return normalized;
+}
+
+test "logical cd chdirs the canonicalized path rather than the operand" {
+    const TestHost = struct {
+        const Self = @This();
+
+        last_target: []const u8 = "",
+        stderr: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *Self) void {
+            self.stderr.deinit(std.testing.allocator);
+            self.* = undefined;
+        }
+
+        fn currentDir(_: *Self, allocator: std.mem.Allocator) ![]const u8 {
+            return allocator.dupe(u8, "/logical/link");
+        }
+
+        fn changeDir(self: *Self, target: []const u8) !void {
+            self.last_target = target;
+        }
+
+        fn currentParentProcessId(_: *Self) host_mod.Pid {
+            return 1;
+        }
+
+        fn writeAll(self: *Self, fd: host_mod.Fd, bytes: []const u8) !void {
+            if (fd == .stderr) try self.stderr.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    const TestShell = struct {
+        const Self = @This();
+
+        host: TestHost,
+        state: state_mod.State,
+        env: []const [*:0]const u8 = &.{},
+        scratch: std.mem.Allocator,
+
+        fn scratchAllocator(self: *Self) std.mem.Allocator {
+            return self.scratch;
+        }
+    };
+
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    var shell: TestShell = .{
+        .host = .{},
+        .state = state_mod.State.init(std.testing.allocator, .{}),
+        .scratch = scratch.allocator(),
+    };
+    defer shell.host.deinit();
+    defer shell.state.deinit();
+    try shell.state.putVariable(.{ .name = "PWD", .value = "/logical/link", .exported = true });
+
+    try std.testing.expectEqual(
+        @as(result.ExitStatus, 0),
+        (try changeDirectoryBuiltin(&shell, "cd", "..", false, false, false)).status,
+    );
+    try std.testing.expectEqualStrings("/logical", shell.host.last_target);
+    try std.testing.expectEqualStrings("/logical", shell.state.getVariable("PWD").?.value);
+    try std.testing.expectEqualStrings("/logical/link", shell.state.getVariable("OLDPWD").?.value);
 }
 
 fn staticDeclarationBuiltinName(shell: anytype, word: ast.Word) !?builtin.Id {
