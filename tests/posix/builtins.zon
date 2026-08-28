@@ -201,6 +201,23 @@
             .status = 0,
         },
         .{
+            .name = "cd -L rejects a non-directory component before dot-dot",
+            .script =
+            \\: >file
+            \\before=$PWD
+            \\cd file/.. 2>/dev/null
+            \\status=$?
+            \\test "$PWD" = "$before"
+            \\printf '<%s>:<%s>\n' "$status" "$?"
+            ,
+            .stdout =
+            \\<1>:<0>
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
             .name = "read with -r preserves backslash characters",
             .script =
             \\printf 'a b\\c\n' | { read -r first rest; printf '<%s>:<%s>\n' "$first" "$rest"; }
