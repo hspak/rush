@@ -400,6 +400,23 @@
             .status = 0,
         },
         .{
+            .name = "command word expansion precedes command redirections",
+            .script =
+            \\printf 'arg=<%s>\n' "$(printf 'side\n' >&2; printf value)" 2>later
+            \\printf 'later=<%s>\n' "$(cat later)"
+            ,
+            .stdout =
+            \\arg=<value>
+            \\later=<>
+            \\
+            ,
+            .stderr =
+            \\side
+            \\
+            ,
+            .status = 0,
+        },
+        .{
             .name = "exec redirection order preserves duplicated stderr route before stdout redirect",
             .script =
             \\( exec 2>&1 >out; printf 'err\n' >&2 )

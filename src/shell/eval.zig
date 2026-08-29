@@ -1755,6 +1755,16 @@ fn evalSimpleScoped(shell: anytype, command: ast.SimpleCommand) EvalError!result
         return .{ .status = status };
     }
 
+    const declaration_id = if (command.words.len != 0)
+        try staticDeclarationBuiltinName(shell, command.words[0])
+    else
+        null;
+    var expansion_status: ?result.ExitStatus = null;
+    const fields: []const []const u8 = if (command.words.len != 0 and declaration_id == null)
+        try expandWordFields(shell, command.words, &expansion_status)
+    else
+        &.{};
+
     const has_redirections = command.redirections.len != 0;
     var redirections: AppliedRedirections = if (has_redirections)
         applyRedirections(shell, command.redirections) catch |err| switch (err) {
@@ -1770,15 +1780,11 @@ fn evalSimpleScoped(shell: anytype, command: ast.SimpleCommand) EvalError!result
         return .{};
     }
 
-    if (try staticDeclarationBuiltinName(shell, command.words[0])) |id| {
-        if (id == .declare or id == .export_ or id == .readonly or id == .typeset or id == .local) {
-            try applyAssignments(shell, command.assignments);
-            return evalDeclarationBuiltin(shell, id, command.words[1..]);
-        }
+    if (declaration_id) |id| {
+        try applyAssignments(shell, command.assignments);
+        return evalDeclarationBuiltin(shell, id, command.words[1..]);
     }
 
-    var expansion_status: ?result.ExitStatus = null;
-    const fields = try expandWordFields(shell, command.words, &expansion_status);
     if (fields.len == 0) {
         const status = try applyAssignmentsWithStatus(shell, command.assignments);
         return .{ .status = expansion_status orelse status };
