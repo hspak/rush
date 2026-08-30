@@ -65,5 +65,20 @@
             .stderr = "",
             .status = 0,
         },
+        .{
+            .name = "expand_aliases substitutes function definition names",
+            .script =
+            \\shopt -s expand_aliases
+            \\alias f=g
+            \\f() { printf '%s\n' function; }
+            \\f
+            ,
+            .stdout =
+            \\function
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
     },
 }

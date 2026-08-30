@@ -299,7 +299,9 @@ pub fn ShellWithBuiltins(comptime Host: type, comptime builtin_registry: builtin
             const chunk_src: source.Source = .{ .id = src.id, .kind = src.kind, .name = src.name, .text = text };
 
             const ast_allocator = self.astAllocator();
-            const lexed = try lexer.lexWithAliasesSource(ast_allocator, chunk_src, self.state);
+            const lexed = try lexer.lexWithAliasesSourceOptions(ast_allocator, chunk_src, self.state, .{
+                .autoload_function_name = self.autoloading_function,
+            });
             const program = try parser.parseWithAliasesAndOptions(
                 ast_allocator,
                 lexed.source,
