@@ -88,16 +88,40 @@ pub fn semanticContext(
     };
 }
 
+pub const CommandPath = struct {
+    items: [16]std.json.Value,
+    len: usize,
+
+    pub fn commands(self: *const CommandPath) []const std.json.Value {
+        std.debug.assert(self.len > 0);
+        std.debug.assert(self.len <= self.items.len);
+        return self.items[0..self.len];
+    }
+
+    pub fn command(self: *const CommandPath) std.json.Value {
+        const path = self.commands();
+        return path[path.len - 1];
+    }
+};
+
 pub fn selectedCommand(
     root: std.json.Value,
     words: []const Word,
     current_word_index: ?usize,
     providers: ?std.json.Value,
 ) ?std.json.Value {
-    var command = root;
-    var command_path: [16]std.json.Value = undefined;
-    command_path[0] = command;
-    var command_path_len: usize = 1;
+    const path = selectedCommandPath(root, words, current_word_index, providers);
+    return path.command();
+}
+
+pub fn selectedCommandPath(
+    root: std.json.Value,
+    words: []const Word,
+    current_word_index: ?usize,
+    providers: ?std.json.Value,
+) CommandPath {
+    var path: CommandPath = .{ .items = undefined, .len = 1 };
+    path.items[0] = root;
     var pending_option_value = false;
     var options_terminated = false;
     const limit = if (current_word_index) |index| @min(index, words.len) else words.len;
@@ -112,22 +136,21 @@ pub fn selectedCommand(
             continue;
         }
         if (!options_terminated and std.mem.startsWith(u8, word.text, "-")) {
-            if (optionTokenForContext(command_path[0..command_path_len], word.text)) |parsed| {
+            if (optionTokenForContext(path.commands(), word.text)) |parsed| {
                 pending_option_value = parsed.value == null and jsonObjectField(parsed.option, "value") != null;
             }
             continue;
         }
         if (options_terminated) break;
-        if (subcommandForName(command, providers, word.text)) |subcommand| {
-            command = subcommand;
-            if (command_path_len == command_path.len) return command;
-            command_path[command_path_len] = command;
-            command_path_len += 1;
+        if (subcommandForName(path.command(), providers, word.text)) |subcommand| {
+            if (path.len == path.items.len) return path;
+            path.items[path.len] = subcommand;
+            path.len += 1;
             continue;
         }
         break;
     }
-    return command;
+    return path;
 }
 
 pub fn argumentProvider(command: std.json.Value, operand_index: usize) ?std.json.Value {

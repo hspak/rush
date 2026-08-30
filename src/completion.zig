@@ -379,13 +379,13 @@ fn completeFromManifest(
         if (index > command_word_index) index - command_word_index - 1 else 0
     else
         null;
-    // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
-    const current = manifest.selectedCommand(
+    const command_path = manifest.selectedCommandPath(
         command,
         analyzed.words[command_word_index + 1 ..],
         current_relative_word_index,
         providers,
-    ) orelse command;
+    );
+    const current = command_path.command();
     const semantic = manifest.semanticContext(
         analyzed.words,
         analyzed.current_word_index,
@@ -395,7 +395,13 @@ fn completeFromManifest(
     );
 
     if (semantic.complete_options) {
-        try appendOptionCandidates(allocator, builder, current, analyzed.replace_start, analyzed.replace_end);
+        try appendOptionCandidates(
+            allocator,
+            builder,
+            command_path.commands(),
+            analyzed.replace_start,
+            analyzed.replace_end,
+        );
         try appendOptionProviderCandidates(
             allocator,
             io,
@@ -403,6 +409,7 @@ fn completeFromManifest(
             builder,
             analyzed,
             semantic,
+            command_path.commands(),
             command,
             current,
             providers,
@@ -475,12 +482,19 @@ fn completeFromManifest(
 fn appendOptionCandidates(
     allocator: std.mem.Allocator,
     builder: *Builder,
-    command: std.json.Value,
+    command_path: []const std.json.Value,
     replace_start: usize,
     replace_end: usize,
 ) !void {
-    const options = jsonArrayField(command, "options") orelse return;
-    for (options.items) |option| try appendOptionCandidate(allocator, builder, option, replace_start, replace_end);
+    var command_index = command_path.len;
+    while (command_index > 0) {
+        command_index -= 1;
+        const options = jsonArrayField(command_path[command_index], "options") orelse continue;
+        for (options.items) |option| {
+            if (command_index + 1 != command_path.len and !(jsonBoolField(option, "inherit") orelse true)) continue;
+            try appendOptionCandidate(allocator, builder, option, replace_start, replace_end);
+        }
+    }
 }
 
 fn appendOptionProviderCandidates(
@@ -490,27 +504,33 @@ fn appendOptionProviderCandidates(
     builder: *Builder,
     analyzed: AnalyzedLine,
     semantic: manifest.Semantic,
+    command_path: []const std.json.Value,
     root_command: std.json.Value,
     command: std.json.Value,
     providers: ?std.json.Value,
     companion_path: ?[]const u8,
 ) !void {
-    const options = jsonArrayField(command, "options") orelse return;
-    for (options.items) |option| {
-        const provider = jsonField(option, "provider") orelse continue;
-        try appendProviderCandidates(
-            allocator,
-            io,
-            sh,
-            builder,
-            analyzed,
-            semantic,
-            root_command,
-            command,
-            providers,
-            provider,
-            companion_path,
-        );
+    var command_index = command_path.len;
+    while (command_index > 0) {
+        command_index -= 1;
+        const options = jsonArrayField(command_path[command_index], "options") orelse continue;
+        for (options.items) |option| {
+            if (command_index + 1 != command_path.len and !(jsonBoolField(option, "inherit") orelse true)) continue;
+            const provider = jsonField(option, "provider") orelse continue;
+            try appendProviderCandidates(
+                allocator,
+                io,
+                sh,
+                builder,
+                analyzed,
+                semantic,
+                root_command,
+                command,
+                providers,
+                provider,
+                companion_path,
+            );
+        }
     }
 }
 
@@ -1341,6 +1361,69 @@ test "completion loads manifest subcommands" {
         if (std.mem.eql(u8, candidate.value, "build")) return;
     }
     return error.ExpectedZigBuildCandidate;
+}
+
+test "completion offers inherited options within nested subcommands" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fmt.allocPrint(allocator, "rush-test-inherited-options-{d}", .{std.c.getpid()});
+    defer allocator.free(root);
+    // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const completions_dir = try std.fs.path.join(allocator, &.{ root, "rush", "completions" });
+    defer allocator.free(completions_dir);
+    try std.Io.Dir.cwd().createDirPath(io, completions_dir);
+    const manifest_path = try std.fs.path.join(allocator, &.{ completions_dir, "nested-options.json" });
+    defer allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = manifest_path,
+        .data =
+        \\{
+        \\  "manifestVersion": 1,
+        \\  "command": {
+        \\    "name": "nested-options",
+        \\    "options": [
+        \\      { "long": "global" },
+        \\      { "long": "root-only", "inherit": false }
+        \\    ],
+        \\    "subcommands": [ {
+        \\      "name": "middle",
+        \\      "options": [ { "long": "middle" } ],
+        \\      "subcommands": [ {
+        \\        "name": "leaf",
+        \\        "options": [ { "long": "leaf" } ]
+        \\      } ]
+        \\    } ]
+        \\  }
+        \\}
+        ,
+    });
+
+    var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(allocator, .{}, .{});
+    defer sh.deinit();
+    try sh.state.putVariable(.{ .name = "XDG_DATA_HOME", .value = root });
+
+    const source = "nested-options middle leaf --";
+    var application = try complete(&sh, allocator, io, source, source.len);
+    defer application.deinit(allocator);
+    const candidates = switch (application) {
+        .ambiguous => |candidates| candidates,
+        else => return error.ExpectedInheritedOptionCandidates,
+    };
+    var found_global = false;
+    var found_middle = false;
+    var found_leaf = false;
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.value, "--global")) found_global = true;
+        if (std.mem.eql(u8, candidate.value, "--middle")) found_middle = true;
+        if (std.mem.eql(u8, candidate.value, "--leaf")) found_leaf = true;
+        try std.testing.expect(!std.mem.eql(u8, candidate.value, "--root-only"));
+    }
+    try std.testing.expect(found_global);
+    try std.testing.expect(found_middle);
+    try std.testing.expect(found_leaf);
 }
 
 test "completion loads dynamic subcommands from manifest providers" {
