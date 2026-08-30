@@ -348,6 +348,34 @@
             .status = 0,
         },
         .{
+            .name = "alias substitution ignores following function definition tokens",
+            .script =
+            \\alias f=g
+            \\f() { printf '%s\n' function; }
+            \\f
+            ,
+            .stdout =
+            \\function
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
+            .name = "non-name alias can introduce a function definition name",
+            .script =
+            \\alias x-y=f
+            \\x-y() { printf '%s\n' function; }
+            \\f
+            ,
+            .stdout =
+            \\function
+            \\
+            ,
+            .stderr = "",
+            .status = 0,
+        },
+        .{
             .name = "function bodies capture aliases at definition time",
             .script =
             \\alias hit='printf "%s\n" alias'

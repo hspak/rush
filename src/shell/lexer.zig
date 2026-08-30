@@ -68,6 +68,16 @@ pub const AliasLexResult = struct {
     tokens: []const token.Token,
 };
 
+/// Context supplied by evaluator-owned parsing paths that require a narrow
+/// exception to ordinary alias substitution.
+pub const AliasOptions = struct {
+    /// Protects the selected autoload function's declaration while its source
+    /// is parsed. Ordinary shell input must leave this unset: alias eligibility
+    /// is determined without considering tokens that follow the candidate. The
+    /// name is borrowed for the duration of the lexing call.
+    autoload_function_name: ?[]const u8 = null,
+};
+
 /// Text introduced by an alias remains marked until recursive alias
 /// substitution finishes, so that alias cannot expand itself again while
 /// independent occurrences of the same name remain eligible.
@@ -100,6 +110,20 @@ pub fn lexWithAliasesSource(
     src: source_mod.Source,
     shell_state: state_mod.State,
 ) std.mem.Allocator.Error!AliasLexResult {
+    return lexWithAliasesSourceOptions(allocator, src, shell_state, .{});
+}
+
+/// Matches `lexWithAliasesSource` ownership and lifetimes while allowing the
+/// evaluator to identify an autoload function declaration that must retain its
+/// requested name. Do not set the option for ordinary shell input.
+pub fn lexWithAliasesSourceOptions(
+    allocator: std.mem.Allocator,
+    src: source_mod.Source,
+    shell_state: state_mod.State,
+    options: AliasOptions,
+) std.mem.Allocator.Error!AliasLexResult {
+    if (options.autoload_function_name) |name| std.debug.assert(name.len != 0);
+
     var current_src = src;
     var active_alias_spans: []const ActiveAliasSpan = &.{};
     while (true) {
@@ -110,6 +134,7 @@ pub fn lexWithAliasesSource(
             tokens,
             shell_state,
             active_alias_spans,
+            options,
         ) orelse return .{
             .source = current_src,
             .tokens = tokens,
@@ -125,6 +150,7 @@ fn aliasExpandedSource(
     tokens: []const token.Token,
     shell_state: state_mod.State,
     active_alias_spans: []const ActiveAliasSpan,
+    options: AliasOptions,
 ) std.mem.Allocator.Error!?AliasExpansion {
     if (shell_state.aliases.count() == 0) return null;
     if (!aliasesEnabled(shell_state)) return null;
@@ -138,7 +164,7 @@ fn aliasExpandedSource(
     var command_position = true;
     var skip_redirection_target = false;
 
-    for (tokens) |tok| {
+    for (tokens, 0..) |tok, index| {
         if (tok.kind == .eof) break;
         try appendAliasSourceSlice(
             allocator,
@@ -179,7 +205,9 @@ fn aliasExpandedSource(
                 );
                 continue;
             }
-            if (command_position and !tok.quoted and !token.isAssignmentWord(tok.text)) {
+            if (command_position and !tok.quoted and !token.isAssignmentWord(tok.text) and
+                !isAutoloadFunctionDefinitionName(tokens, index, options.autoload_function_name))
+            {
                 if (shell_state.getAlias(tok.text)) |alias| {
                     if (!aliasIsActive(active_alias_spans, tok.span.start, tok.span.end, alias.name)) {
                         const replacement_start = output.items.len;
@@ -337,6 +365,18 @@ fn aliasIsActive(
             std.mem.eql(u8, span.name, name)) return true;
     }
     return false;
+}
+
+fn isAutoloadFunctionDefinitionName(
+    tokens: []const token.Token,
+    index: usize,
+    autoload_function_name: ?[]const u8,
+) bool {
+    const name = autoload_function_name orelse return false;
+    return std.mem.eql(u8, tokens[index].text, name) and
+        index + 2 < tokens.len and
+        tokens[index + 1].kind == .left_paren and
+        tokens[index + 2].kind == .right_paren;
 }
 
 pub fn aliasesEnabled(shell_state: state_mod.State) bool {
@@ -1768,4 +1808,42 @@ test "alias substitution copies here-document bodies verbatim" {
 
     // The command-position `hi` after the body expands; the body line does not.
     try std.testing.expectEqualStrings("cat <<E\nhi\nE\nprintf hi\n", lexed.source.text);
+}
+
+test "self-referential alias expands only once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var shell_state = state_mod.State.init(std.testing.allocator, .{ .mode = .posix });
+    defer shell_state.deinit();
+    try shell_state.putAlias(.{ .name = "ls", .value = "ls -lhv --color --group-directories-first" });
+
+    const src: source_mod.Source = .{
+        .id = 1,
+        .kind = .script_file,
+        .name = "test",
+        .text = "ls\n",
+    };
+    const lexed = try lexWithAliasesSource(allocator, src, shell_state);
+
+    try std.testing.expectEqualStrings("ls -lhv --color --group-directories-first\n", lexed.source.text);
+}
+
+test "autoload function definition name bypasses alias substitution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var shell_state = state_mod.State.init(std.testing.allocator, .{ .interactive = true });
+    defer shell_state.deinit();
+    try shell_state.putAlias(.{ .name = "ls", .value = "ls -lhv --color --group-directories-first" });
+
+    const src: source_mod.Source = .{
+        .id = 1,
+        .kind = .sourced_file,
+        .name = "test",
+        .text = "ls() { printf hi; }\n",
+    };
+    const lexed = try lexWithAliasesSourceOptions(allocator, src, shell_state, .{ .autoload_function_name = "ls" });
+
+    try std.testing.expectEqualStrings(src.text, lexed.source.text);
 }

@@ -317,6 +317,52 @@ test "autoload sources dotted function into current shell and hides load output"
     try std.testing.expectEqualStrings("redefined", redefined_output);
 }
 
+test "autoload protects function definition from same-name alias" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fmt.allocPrint(allocator, "rush-test-autoload-alias-{d}", .{std.c.getpid()});
+    defer allocator.free(root);
+    // ziglint-ignore: Z026 intentional best-effort cleanup; preserve behavior
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const functions_dir = try std.fs.path.join(allocator, &.{ root, "rush", "functions" });
+    defer allocator.free(functions_dir);
+    try std.Io.Dir.cwd().createDirPath(io, functions_dir);
+
+    const name = "rush_alias_autoload_test_function";
+    const function_path = try std.fs.path.join(allocator, &.{ functions_dir, name ++ ".rush" });
+    defer allocator.free(function_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = function_path,
+        .data = name ++ "(){ printf '<%s>\\n' \"$1\"; }\n",
+    });
+
+    var sh = TestRushShell.init(allocator, .{}, .{ .state = .{ .expand_aliases = true } });
+    defer sh.deinit();
+    sh.setFunctionAutoload(testAutoload);
+    try sh.state.putVariable(.{ .name = "XDG_CONFIG_HOME", .value = root });
+    try sh.state.putAlias(.{ .name = name, .value = name ++ " prefixed" });
+
+    const out_path = try std.fs.path.join(allocator, &.{ root, "out.txt" });
+    defer allocator.free(out_path);
+    const command = try std.fmt.allocPrint(allocator, "{s} > {s}", .{ name, out_path });
+    defer allocator.free(command);
+    const evaluated = try sh.evalSource(.{
+        .id = 1,
+        .kind = .command_string,
+        .name = "test",
+        .text = command,
+    });
+    try std.testing.expectEqual(@as(shell.result.ExitStatus, 0), evaluated.status);
+
+    const output = try std.Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(1024));
+    defer allocator.free(output);
+    try std.testing.expectEqualStrings("<prefixed>\n", output);
+    try std.testing.expect(sh.state.getFunction(name) != null);
+    try std.testing.expectEqualStrings(name ++ " prefixed", sh.state.getAlias(name).?.value);
+}
+
 test "autoload caches misses until function is explicitly defined" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
