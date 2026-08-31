@@ -25,8 +25,8 @@ pub fn semanticContext(
 ) Semantic {
     var operand_index: usize = 0;
     var options_terminated = false;
-    var pending_option_value: ?std.json.Value = null;
-    var pending_option_word_index: ?usize = null;
+    var pending_option: ?std.json.Value = null;
+    var pending_value_index: usize = 0;
     var command = root_command;
     var command_path: [16]std.json.Value = undefined;
     command_path[0] = command;
@@ -34,9 +34,9 @@ pub fn semanticContext(
     const current_index = current_word_index orelse words.len;
     for (words[command_word_index + 1 ..], command_word_index + 1..) |word, absolute_index| {
         if (absolute_index >= current_index) break;
-        if (pending_option_value != null) {
-            pending_option_value = null;
-            pending_option_word_index = null;
+        if (pending_option) |option| {
+            pending_value_index += 1;
+            if (pending_value_index >= optionValueCount(option)) pending_option = null;
             continue;
         }
         if (std.mem.eql(u8, word.text, "--")) {
@@ -45,10 +45,10 @@ pub fn semanticContext(
         }
         if (!options_terminated and std.mem.startsWith(u8, word.text, "-")) {
             if (optionTokenForContext(command_path[0..command_path_len], word.text)) |parsed| {
-                if (jsonObjectField(parsed.option, "value")) |value| {
-                    if (parsed.value != null) continue;
-                    pending_option_value = value;
-                    pending_option_word_index = absolute_index;
+                const consumed_values: usize = if (parsed.value != null) 1 else 0;
+                if (consumed_values < optionValueCount(parsed.option)) {
+                    pending_option = parsed.option;
+                    pending_value_index = consumed_values;
                 }
             }
             continue;
@@ -69,14 +69,16 @@ pub fn semanticContext(
         operand_index += 1;
     }
 
-    if (pending_option_value) |value| {
-        if (pending_option_word_index != null) {
-            return .{
-                .operand_index = operand_index,
-                .options_terminated = options_terminated,
-                .option_value_provider = jsonField(value, "provider"),
-            };
-        }
+    if (pending_option) |option| {
+        const value = optionValueAt(option, pending_value_index) orelse return .{
+            .operand_index = operand_index,
+            .options_terminated = options_terminated,
+        };
+        return .{
+            .operand_index = operand_index,
+            .options_terminated = options_terminated,
+            .option_value_provider = jsonField(value, "provider"),
+        };
     }
 
     const prefix_is_option = prefix.len != 0 and prefix[0] == '-' and !options_terminated;
@@ -122,13 +124,13 @@ pub fn selectedCommandPath(
 ) CommandPath {
     var path: CommandPath = .{ .items = undefined, .len = 1 };
     path.items[0] = root;
-    var pending_option_value = false;
+    var pending_option_values: usize = 0;
     var options_terminated = false;
     const limit = if (current_word_index) |index| @min(index, words.len) else words.len;
     for (words, 0..) |word, relative_index| {
         if (relative_index >= limit) break;
-        if (pending_option_value) {
-            pending_option_value = false;
+        if (pending_option_values != 0) {
+            pending_option_values -= 1;
             continue;
         }
         if (std.mem.eql(u8, word.text, "--")) {
@@ -137,7 +139,8 @@ pub fn selectedCommandPath(
         }
         if (!options_terminated and std.mem.startsWith(u8, word.text, "-")) {
             if (optionTokenForContext(path.commands(), word.text)) |parsed| {
-                pending_option_value = parsed.value == null and jsonObjectField(parsed.option, "value") != null;
+                const consumed_values: usize = if (parsed.value != null) 1 else 0;
+                pending_option_values = optionValueCount(parsed.option) - consumed_values;
             }
             continue;
         }
@@ -214,7 +217,7 @@ fn optionForSpelling(command: std.json.Value, spelling: []const u8) ?std.json.Va
 
 fn optionToken(option: std.json.Value, token: []const u8) ?ParsedOptionToken {
     if (optionMatchesSpelling(option, token)) return .{ .option = option };
-    if (jsonObjectField(option, "value") == null) return null;
+    if (optionValueCount(option) == 0) return null;
 
     if (jsonStringField(option, "long")) |long| {
         if (token.len >= long.len + 3 and
@@ -232,6 +235,24 @@ fn optionToken(option: std.json.Value, token: []const u8) ?ParsedOptionToken {
         }
     }
     return null;
+}
+
+pub fn optionValueCount(option: std.json.Value) usize {
+    const value = jsonField(option, "value") orelse return 0;
+    return switch (value) {
+        .object => 1,
+        .array => |values| values.items.len,
+        else => 0,
+    };
+}
+
+pub fn optionValueAt(option: std.json.Value, index: usize) ?std.json.Value {
+    const value = jsonField(option, "value") orelse return null;
+    return switch (value) {
+        .object => if (index == 0) value else null,
+        .array => |values| if (index < values.items.len) values.items[index] else null,
+        else => null,
+    };
 }
 
 fn optionMatchesSpelling(option: std.json.Value, spelling: []const u8) bool {

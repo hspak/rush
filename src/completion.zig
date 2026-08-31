@@ -786,6 +786,7 @@ fn parsedOptionsForProvider(
     var options: std.ArrayList(extensions.rush.CompletionParsedOption) = .empty;
     errdefer options.deinit(allocator);
     var pending_index: ?usize = null;
+    var pending_values: usize = 0;
     var options_terminated = false;
     var command = root_command;
     var command_path: [16]std.json.Value = undefined;
@@ -795,8 +796,19 @@ fn parsedOptionsForProvider(
     for (analyzed.words[command_index + 1 ..], command_index + 1..) |word, absolute_index| {
         if (absolute_index >= current_word_index) break;
         if (pending_index) |index| {
-            options.items[index].value = word.text;
-            pending_index = null;
+            if (options.items[index].value == null) {
+                options.items[index].value = word.text;
+            } else {
+                const option = options.items[index];
+                try options.append(allocator, .{
+                    .spelling = option.spelling,
+                    .name = option.name,
+                    .key = option.key,
+                    .value = word.text,
+                });
+            }
+            pending_values -= 1;
+            if (pending_values == 0) pending_index = null;
             continue;
         }
         if (std.mem.eql(u8, word.text, "--")) {
@@ -812,7 +824,9 @@ fn parsedOptionsForProvider(
                 .key = name,
                 .value = parsed.value,
             });
-            if (parsed.value == null and jsonObjectField(parsed.option, "value") != null) {
+            const consumed_values: usize = if (parsed.value != null) 1 else 0;
+            pending_values = manifest.optionValueCount(parsed.option) - consumed_values;
+            if (pending_values != 0) {
                 pending_index = options.items.len - 1;
             }
             continue;
@@ -839,7 +853,7 @@ fn operandsForProvider(
     var operands: std.ArrayList(extensions.rush.CompletionParsedOperand) = .empty;
     errdefer operands.deinit(allocator);
     var operand_index: usize = 0;
-    var pending_option_value = false;
+    var pending_option_values: usize = 0;
     var options_terminated = false;
     var command = root_command;
     var command_path: [16]std.json.Value = undefined;
@@ -848,8 +862,8 @@ fn operandsForProvider(
     const current_word_index = analyzed.current_word_index orelse analyzed.words.len;
     for (analyzed.words[command_index + 1 ..], command_index + 1..) |word, absolute_index| {
         if (absolute_index >= current_word_index) break;
-        if (pending_option_value) {
-            pending_option_value = false;
+        if (pending_option_values != 0) {
+            pending_option_values -= 1;
             continue;
         }
         if (std.mem.eql(u8, word.text, "--")) {
@@ -858,7 +872,8 @@ fn operandsForProvider(
         }
         if (!options_terminated and std.mem.startsWith(u8, word.text, "-")) {
             if (manifest.optionTokenForContext(command_path[0..command_path_len], word.text)) |parsed| {
-                pending_option_value = parsed.value == null and jsonObjectField(parsed.option, "value") != null;
+                const consumed_values: usize = if (parsed.value != null) 1 else 0;
+                pending_option_values = manifest.optionValueCount(parsed.option) - consumed_values;
             }
             continue;
         }
@@ -1577,6 +1592,54 @@ test "manifest selection accepts attached root option values before a subcommand
     defer std.testing.allocator.free(options);
     try std.testing.expectEqual(@as(usize, 1), options.len);
     try std.testing.expectEqualStrings("example", options[0].value.?);
+}
+
+test "completion semantics consume multi-word option values" {
+    const manifest_text =
+        \\{
+        \\  "name": "tool",
+        \\  "options": [
+        \\    { "long": "pair", "value": [
+        \\      { "name": "first", "provider": "first-values" },
+        \\      { "name": "second", "provider": "second-values" }
+        \\    ] }
+        \\  ],
+        \\  "subcommands": [ { "name": "run" } ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, manifest_text, .{});
+    defer parsed.deinit();
+
+    const pending_source = "tool --pair one ";
+    const pending = try analyzeLine(std.testing.allocator, pending_source, pending_source.len);
+    defer pending.deinit(std.testing.allocator);
+    const pending_semantic = manifest.semanticContext(
+        pending.words,
+        pending.current_word_index,
+        pending.prefix,
+        pending.command_word_index.?,
+        parsed.value,
+    );
+    try std.testing.expectEqualStrings("second-values", pending_semantic.option_value_provider.?.string);
+
+    const source = "tool --pair=one two run argument ";
+    const analyzed = try analyzeLine(std.testing.allocator, source, source.len);
+    defer analyzed.deinit(std.testing.allocator);
+    const words = analyzed.words[analyzed.command_word_index.? + 1 ..];
+    const current = manifest.selectedCommand(parsed.value, words, null, null).?;
+    try std.testing.expectEqualStrings("run", manifest.commandName(current).?);
+
+    const options = try parsedOptionsForProvider(std.testing.allocator, analyzed, parsed.value);
+    defer std.testing.allocator.free(options);
+    try std.testing.expectEqual(@as(usize, 2), options.len);
+    try std.testing.expectEqualStrings("one", options[0].value.?);
+    try std.testing.expectEqualStrings("two", options[1].value.?);
+
+    const operands = try operandsForProvider(std.testing.allocator, analyzed, parsed.value);
+    defer std.testing.allocator.free(operands);
+    try std.testing.expectEqual(@as(usize, 1), operands.len);
+    try std.testing.expectEqualStrings("argument", operands[0].value);
+    try std.testing.expectEqual(@as(usize, 0), operands[0].index);
 }
 
 test "z completion uses Rush frecent directory history" {
