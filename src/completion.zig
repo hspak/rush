@@ -58,9 +58,11 @@ pub fn complete(
         return applyBuiltCandidates(allocator, source, &builder, analyzed);
     }
 
-    if (analyzed.root) |root| {
-        if (try completeFromManifest(allocator, io, sh, &builder, analyzed, root)) |handled| {
-            if (handled) return applyBuiltCandidates(allocator, source, &builder, analyzed);
+    if (!analyzed.completing_redirection_target) {
+        if (analyzed.root) |root| {
+            if (try completeFromManifest(allocator, io, sh, &builder, analyzed, root)) |handled| {
+                if (handled) return applyBuiltCandidates(allocator, source, &builder, analyzed);
+            }
         }
     }
 
@@ -105,6 +107,7 @@ const AnalyzedLine = struct {
     kind: CompletionKind,
     root: ?[]const u8,
     command_word_index: ?usize,
+    completing_redirection_target: bool,
 
     fn deinit(self: AnalyzedLine, allocator: std.mem.Allocator) void {
         allocator.free(self.words);
@@ -143,6 +146,7 @@ fn analyzeLine(allocator: std.mem.Allocator, source: []const u8, raw_cursor: usi
             .text = source[tok.span.start..tok.span.end],
             .start = tok.span.start,
             .end = tok.span.end,
+            .redirection_target = class == .redirection_target,
         });
         if (class == .command) command_word_index = index;
         if (class == .reserved and tracker.command_position) command_word_index = null;
@@ -191,6 +195,10 @@ fn analyzeLine(allocator: std.mem.Allocator, source: []const u8, raw_cursor: usi
         tracker.command_position and !tracker.skip_redirection_target;
     const kind: CompletionKind = if (parameter) .parameter else if (is_command) .command else .argument;
     const root = if (command_word_index) |index| words.items[index].text else null;
+    const completing_redirection_target = if (current_word_class) |class|
+        class == .redirection_target
+    else
+        tracker.skip_redirection_target;
 
     return .{
         .words = try words.toOwnedSlice(allocator),
@@ -203,6 +211,7 @@ fn analyzeLine(allocator: std.mem.Allocator, source: []const u8, raw_cursor: usi
         .kind = kind,
         .root = root,
         .command_word_index = command_word_index,
+        .completing_redirection_target = completing_redirection_target,
     };
 }
 
@@ -795,6 +804,7 @@ fn parsedOptionsForProvider(
     const current_word_index = analyzed.current_word_index orelse analyzed.words.len;
     for (analyzed.words[command_index + 1 ..], command_index + 1..) |word, absolute_index| {
         if (absolute_index >= current_word_index) break;
+        if (word.redirection_target) continue;
         if (pending_index) |index| {
             if (options.items[index].value == null) {
                 options.items[index].value = word.text;
@@ -862,6 +872,7 @@ fn operandsForProvider(
     const current_word_index = analyzed.current_word_index orelse analyzed.words.len;
     for (analyzed.words[command_index + 1 ..], command_index + 1..) |word, absolute_index| {
         if (absolute_index >= current_word_index) break;
+        if (word.redirection_target) continue;
         if (pending_option_values != 0) {
             pending_option_values -= 1;
             continue;
@@ -1297,6 +1308,7 @@ test "completion treats redirection targets as arguments" {
     defer analyzed.deinit(std.testing.allocator);
     try std.testing.expectEqual(CompletionKind.argument, analyzed.kind);
     try std.testing.expectEqual(@as(?[]const u8, null), analyzed.root);
+    try std.testing.expect(analyzed.completing_redirection_target);
 }
 
 test "completion keeps escaped spaces inside a single word" {
@@ -1376,6 +1388,20 @@ test "completion loads manifest subcommands" {
         if (std.mem.eql(u8, candidate.value, "build")) return;
     }
     return error.ExpectedZigBuildCandidate;
+}
+
+test "redirection targets bypass manifest argument completion" {
+    var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(std.testing.allocator, .{}, .{});
+    defer sh.deinit();
+
+    const source = "zig > agents";
+    var application = try complete(&sh, std.testing.allocator, std.testing.io, source, source.len);
+    defer application.deinit(std.testing.allocator);
+    const edit = switch (application) {
+        .edit => |edit| edit,
+        else => return error.ExpectedRedirectionPathCompletion,
+    };
+    try std.testing.expectEqualStrings("AGENTS.md", edit.replacement);
 }
 
 test "completion offers inherited options within nested subcommands" {
@@ -1610,7 +1636,7 @@ test "completion semantics consume multi-word option values" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, manifest_text, .{});
     defer parsed.deinit();
 
-    const pending_source = "tool --pair one ";
+    const pending_source = "tool --pair one >ignored ";
     const pending = try analyzeLine(std.testing.allocator, pending_source, pending_source.len);
     defer pending.deinit(std.testing.allocator);
     const pending_semantic = manifest.semanticContext(

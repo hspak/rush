@@ -6,6 +6,7 @@ pub const Word = struct {
     text: []const u8,
     start: usize,
     end: usize,
+    redirection_target: bool = false,
 };
 
 pub const Semantic = struct {
@@ -34,6 +35,7 @@ pub fn semanticContext(
     const current_index = current_word_index orelse words.len;
     for (words[command_word_index + 1 ..], command_word_index + 1..) |word, absolute_index| {
         if (absolute_index >= current_index) break;
+        if (word.redirection_target) continue;
         if (pending_option) |option| {
             pending_value_index += 1;
             if (pending_value_index >= optionValueCount(option)) pending_option = null;
@@ -129,6 +131,7 @@ pub fn selectedCommandPath(
     const limit = if (current_word_index) |index| @min(index, words.len) else words.len;
     for (words, 0..) |word, relative_index| {
         if (relative_index >= limit) break;
+        if (word.redirection_target) continue;
         if (pending_option_values != 0) {
             pending_option_values -= 1;
             continue;
@@ -338,4 +341,26 @@ fn jsonString(value: std.json.Value) ?[]const u8 {
         .string => |string| string,
         else => null,
     };
+}
+
+test "redirection targets do not affect command or operand selection" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{ "name": "tool", "subcommands": [ { "name": "run" } ] }
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    const words = [_]Word{
+        .{ .text = "tool", .start = 0, .end = 4 },
+        .{ .text = "ignored", .start = 6, .end = 13, .redirection_target = true },
+        .{ .text = "run", .start = 14, .end = 17 },
+        .{ .text = "argument", .start = 18, .end = 26 },
+    };
+
+    const selected = selectedCommand(parsed.value, words[1..], null, null).?;
+    try std.testing.expectEqualStrings("run", commandName(selected).?);
+    const semantic = semanticContext(&words, null, "", 0, parsed.value);
+    try std.testing.expectEqual(@as(usize, 1), semantic.operand_index);
 }
