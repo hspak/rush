@@ -68,6 +68,7 @@ pub const Frame = struct {
     cursor_row: usize = 0,
     cursor_col: u16 = 0,
     cursor_shape: CursorShape = .default,
+    width_method: vaxis.gwidth.Method = .unicode,
 
     pub fn deinit(self: *Frame, allocator: std.mem.Allocator) void {
         for (self.lines) |line| allocator.free(line);
@@ -90,6 +91,7 @@ pub const Frame = struct {
             .cursor_row = self.cursor_row,
             .cursor_col = self.cursor_col,
             .cursor_shape = self.cursor_shape,
+            .width_method = self.width_method,
         };
     }
 };
@@ -329,6 +331,7 @@ pub fn frameFromInput(allocator: std.mem.Allocator, input: Input, options: Rende
         .cursor_row = cursor_position.row,
         .cursor_col = cursor_position.col,
         .cursor_shape = options.cursor_shape,
+        .width_method = options.width_method,
     };
 }
 
@@ -494,31 +497,91 @@ fn serializeFrameDiff(
     }
 
     var current_row = previous.cursor_row;
-    const max_lines = @max(previous.lines.len, frame.lines.len);
-    for (0..max_lines) |row| {
-        const old_line = if (row < previous.lines.len) previous.lines[row] else null;
-        const new_line = if (row < frame.lines.len) frame.lines[row] else null;
-        const changed = if (old_line) |old|
-            if (new_line) |new| !std.mem.eql(u8, old, new) else true
-        else
-            new_line != null;
-        if (!changed) continue;
-        const move = if (row >= previous.lines.len and row > current_row)
-            try cursorLineFeedFrom(allocator, current_row, row)
-        else
-            try cursorMoveFrom(allocator, current_row, row, 0);
-        defer allocator.free(move);
-        try output.appendSlice(allocator, move);
-        try output.appendSlice(allocator, "\x1b[2K");
-        if (new_line) |line| try appendSerializedLine(allocator, &output, line);
-        current_row = row;
+    var cursor_positioned = false;
+    if (try appendSingleLineGrowth(allocator, &output, previous, frame)) {
+        current_row = 0;
+        cursor_positioned = frame.cursor_col == visibleWidth(frame.lines[0], frame.width_method);
+    } else {
+        const max_lines = @max(previous.lines.len, frame.lines.len);
+        for (0..max_lines) |row| {
+            const old_line = if (row < previous.lines.len) previous.lines[row] else null;
+            const new_line = if (row < frame.lines.len) frame.lines[row] else null;
+            const changed = if (old_line) |old|
+                if (new_line) |new| !std.mem.eql(u8, old, new) else true
+            else
+                new_line != null;
+            if (!changed) continue;
+            const move = if (row >= previous.lines.len and row > current_row)
+                try cursorLineFeedFrom(allocator, current_row, row)
+            else
+                try cursorMoveFrom(allocator, current_row, row, 0);
+            defer allocator.free(move);
+            try output.appendSlice(allocator, move);
+            try output.appendSlice(allocator, "\x1b[2K");
+            if (new_line) |line| try appendSerializedLine(allocator, &output, line);
+            current_row = row;
+        }
     }
 
-    const cursor_sequence = try cursorMoveFrom(allocator, current_row, frame.cursor_row, frame.cursor_col);
-    defer allocator.free(cursor_sequence);
-    try output.appendSlice(allocator, cursor_sequence);
+    if (!cursor_positioned) {
+        const cursor_sequence = try cursorMoveFrom(allocator, current_row, frame.cursor_row, frame.cursor_col);
+        defer allocator.free(cursor_sequence);
+        try output.appendSlice(allocator, cursor_sequence);
+    }
     if (synchronized_output) try output.appendSlice(allocator, "\x1b[?2026l");
     return output.toOwnedSlice(allocator);
+}
+
+fn appendSingleLineGrowth(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    previous: Frame,
+    frame: Frame,
+) !bool {
+    // Reuse the existing cells only when the terminal cursor is at the old
+    // row's end. Re-establish the style at that point because a previous
+    // multi-row diff may have left the terminal in a lower row's style.
+    if (previous.lines.len != 1 or frame.lines.len != 1 or
+        previous.cursor_row != 0 or frame.cursor_row != 0 or
+        previous.width_method != frame.width_method)
+    {
+        return false;
+    }
+
+    const old_line = previous.lines[0];
+    const new_line = frame.lines[0];
+    if (previous.cursor_col != visibleWidth(old_line, previous.width_method) or
+        old_line.len >= new_line.len or
+        !std.mem.startsWith(u8, new_line, old_line))
+    {
+        return false;
+    }
+
+    try appendLineEndStyle(allocator, output, old_line);
+    try appendSerializedLine(allocator, output, new_line[old_line.len..]);
+    return true;
+}
+
+fn appendLineEndStyle(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    line: []const u8,
+) !void {
+    var active_sgr: std.ArrayList(u8) = .empty;
+    defer active_sgr.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < line.len) {
+        const end = escapeSequenceEnd(line, i) orelse {
+            i += 1;
+            continue;
+        };
+        try updateActiveSgr(allocator, &active_sgr, line[i..end]);
+        i = end;
+    }
+
+    try output.appendSlice(allocator, vaxis.ctlseqs.sgr_reset);
+    try output.appendSlice(allocator, active_sgr.items);
 }
 
 fn appendSerializedLine(allocator: std.mem.Allocator, output: *std.ArrayList(u8), line: []const u8) !void {

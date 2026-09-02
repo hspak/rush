@@ -6164,7 +6164,7 @@ test "frame wrapping computes cursor with wide graphemes" {
     try std.testing.expectEqual(@as(u16, 2), frame.cursor_col);
 }
 
-test "frame renderer diffs changed input line" {
+test "frame renderer appends input without clearing the line" {
     var renderer: FrameRenderer = .{};
     defer renderer.deinit(std.testing.allocator);
 
@@ -6172,7 +6172,7 @@ test "frame renderer diffs changed input line" {
     defer first_editor.deinit();
     try first_editor.handleKey(.{ .key = .text, .text = "a" });
     var first = try frameFromLine(std.testing.allocator, first_editor, .{
-        .prompt = .{ .bytes = "$ " },
+        .prompt = .{ .bytes = "\x1b[31m$ " },
         .synchronized_output = false,
     });
     defer first.deinit(std.testing.allocator);
@@ -6184,17 +6184,43 @@ test "frame renderer diffs changed input line" {
     defer second_editor.deinit();
     try second_editor.handleKey(.{ .key = .text, .text = "ab" });
     var second = try frameFromLine(std.testing.allocator, second_editor, .{
-        .prompt = .{ .bytes = "$ " },
+        .prompt = .{ .bytes = "\x1b[31m$ " },
         .synchronized_output = false,
     });
     defer second.deinit(std.testing.allocator);
     const second_output = try renderer.render(std.testing.allocator, second, .{ .synchronized_output = false });
     defer std.testing.allocator.free(second_output);
 
-    try std.testing.expect(std.mem.indexOf(u8, second_output, "\x1b[J") == null);
-    try std.testing.expect(std.mem.indexOf(u8, second_output, "\x1b[2K$ ab") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second_output, "\r\x1b[0C") == null);
-    try std.testing.expect(std.mem.indexOf(u8, second_output, "\r\x1b[4C") != null);
+    try std.testing.expectEqualStrings("\x1b[m\x1b[31mb", second_output);
+}
+
+test "frame renderer appends repeated spaces without clearing the line" {
+    var renderer: FrameRenderer = .{};
+    defer renderer.deinit(std.testing.allocator);
+
+    var editor = Editor.init(std.testing.allocator);
+    defer editor.deinit();
+    try editor.buffer.replace(" ");
+    var first = try frameFromLine(std.testing.allocator, editor, .{
+        .prompt = .{ .bytes = "$ " },
+        .semantic_prompt_marks = true,
+        .synchronized_output = false,
+    });
+    defer first.deinit(std.testing.allocator);
+    const first_output = try renderer.render(std.testing.allocator, first, .{ .synchronized_output = false });
+    defer std.testing.allocator.free(first_output);
+
+    try editor.buffer.replace("  ");
+    var second = try frameFromLine(std.testing.allocator, editor, .{
+        .prompt = .{ .bytes = "$ " },
+        .semantic_prompt_marks = true,
+        .synchronized_output = false,
+    });
+    defer second.deinit(std.testing.allocator);
+    const second_output = try renderer.render(std.testing.allocator, second, .{ .synchronized_output = false });
+    defer std.testing.allocator.free(second_output);
+
+    try std.testing.expectEqualStrings("\x1b[m ", second_output);
 }
 
 test "frame renderer clears current frame before interrupt output" {
