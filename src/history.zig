@@ -7,8 +7,11 @@ const sqlite = @cImport({
 
 const command_history = @import("shell/command_history.zig");
 const line_editor = @import("editor.zig").line;
+const editor_history = @import("editor/history.zig");
+const event_loop = @import("event_loop.zig");
 const shell_lexer = @import("shell/lexer.zig");
 const shell_source = @import("shell/source.zig");
+const HistoryQueryWorker = @import("history/HistoryQueryWorker.zig");
 
 const ExitStatus = u8;
 
@@ -26,6 +29,7 @@ pub const History = struct {
     hostname: []const u8,
     session_id: []const u8 = "",
     current_cwd: []const u8 = "",
+    persistent_path: ?[]const u8 = null,
     /// Rowid snapshot taken when the database is opened. Arrow-key navigation
     /// sees this session's commands plus rows that already existed at startup,
     /// so concurrent sessions do not interleave into each other mid-session.
@@ -57,6 +61,7 @@ pub const History = struct {
 
     pub fn deinit(self: *History) void {
         _ = sqlite.sqlite3_close(self.db);
+        if (self.persistent_path) |path| self.allocator.free(path);
         self.allocator.free(self.hostname);
         self.* = undefined;
     }
@@ -197,11 +202,15 @@ pub const History = struct {
     pub fn load(self: *History, io: std.Io, path: []const u8) !void {
         std.debug.assert(self.active_command == null);
         if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
         const db = try openHistoryDb(self.allocator, path);
         errdefer _ = sqlite.sqlite3_close(db);
         const session_start_id = try queryMaxHistoryId(db);
         _ = sqlite.sqlite3_close(self.db);
+        if (self.persistent_path) |previous_path| self.allocator.free(previous_path);
         self.db = db;
+        self.persistent_path = owned_path;
         self.session_start_id = session_start_id;
     }
 
@@ -326,9 +335,25 @@ pub const History = struct {
 pub const InteractiveHistoryService = struct {
     history: *History,
     suppress_next_append: bool = false,
+    query_worker: ?*HistoryQueryWorker = null,
 
     pub fn init(history: *History) InteractiveHistoryService {
         return .{ .history = history };
+    }
+
+    pub fn deinit(self: *InteractiveHistoryService) void {
+        if (self.query_worker) |worker| worker.destroy();
+        self.* = undefined;
+    }
+
+    pub fn startQueryWorker(
+        self: *InteractiveHistoryService,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+    ) !void {
+        std.debug.assert(self.query_worker == null);
+        const path = self.history.persistent_path orelse return;
+        self.query_worker = try HistoryQueryWorker.create(allocator, io, path);
     }
 
     pub fn lineEditorView(self: *InteractiveHistoryService, io: std.Io) line_editor.HistoryView {
@@ -341,6 +366,14 @@ pub const InteractiveHistoryService = struct {
             .search = searchHistoryEntry,
             .search_next = searchNextHistoryEntry,
             .suggest = suggestHistoryEntry,
+            .async = if (self.query_worker) |worker| .{
+                .context = self,
+                .wake_fd = worker.wakeFd(),
+                .submit = submitAsyncHistoryRequest,
+                .cancel = cancelAsyncHistoryRequest,
+                .drain_wake = drainAsyncHistoryWake,
+                .take_result = takeAsyncHistoryResult,
+            } else null,
         };
     }
 
@@ -570,6 +603,31 @@ pub const InteractiveHistoryService = struct {
     }
 };
 
+fn submitAsyncHistoryRequest(context: *anyopaque, request: line_editor.HistoryRequest) !void {
+    const history_service: *InteractiveHistoryService = @ptrCast(@alignCast(context));
+    const worker = history_service.query_worker orelse return error.HistoryQueryWorkerUnavailable;
+    try worker.submit(request, history_service.history.current_cwd, history_service.history.session_id);
+}
+
+fn cancelAsyncHistoryRequest(context: *anyopaque) void {
+    const history_service: *InteractiveHistoryService = @ptrCast(@alignCast(context));
+    if (history_service.query_worker) |worker| worker.cancel();
+}
+
+fn drainAsyncHistoryWake(context: *anyopaque) void {
+    const history_service: *InteractiveHistoryService = @ptrCast(@alignCast(context));
+    if (history_service.query_worker) |worker| worker.drainWake();
+}
+
+fn takeAsyncHistoryResult(
+    context: *anyopaque,
+    allocator: std.mem.Allocator, // ziglint-ignore: Z023 (callback iface)
+) !?editor_history.Completion {
+    const history_service: *InteractiveHistoryService = @ptrCast(@alignCast(context));
+    const worker = history_service.query_worker orelse return null;
+    return worker.takeResult(allocator);
+}
+
 fn previousHistoryEntry(
     context: *anyopaque,
     allocator: std.mem.Allocator, // ziglint-ignore: Z023 (callback iface)
@@ -650,7 +708,7 @@ fn applyLineHistoryRequest(session: *line_editor.LineSession, history: line_edit
         .search,
         .search_next,
         => .{ .entries = &.{} },
-        .suggest => .{ .entry = null },
+        .suggest, .cancel_async => .{ .entry = null },
     };
     try session.applyHistoryResult(request, result);
 }
@@ -1549,6 +1607,7 @@ fn initHistorySchema(db: *sqlite.sqlite3) !void {
         \\create index if not exists history_command_started_idx on history(command, started_at);
         \\create index if not exists history_command_id_idx on history(command, id);
         \\create index if not exists history_command_key_id_idx on history(command_key, id);
+        \\create index if not exists history_command_key_cwd_id_idx on history(command_key, cwd, id);
         \\create index if not exists history_command_nocase_id_idx on history(command collate nocase, id);
         \\create index if not exists history_cwd_id_idx on history(cwd, id);
         \\create index if not exists history_status_id_idx on history(status, id);
@@ -2660,6 +2719,79 @@ test "interactive autosuggestion falls back to global sqlite history" {
     const suggestion = (try service.suggestEntry(std.testing.allocator, "l")) orelse return error.TestExpectedEqual;
     defer suggestion.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("ls -la", suggestion.text);
+}
+
+test "persistent history worker returns suggestions and one-query search pages" {
+    const path = "rush-history-query-worker-test.sqlite";
+    try deleteHistoryDbFilesIfExists(std.testing.io, path);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path ++ "-wal") catch {};
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path ++ "-shm") catch {};
+
+    var history = try History.init(std.testing.allocator);
+    defer history.deinit();
+    try history.load(std.testing.io, path);
+    history.current_cwd = "/repo";
+    history.session_id = "worker-session";
+    for (0..25) |index| {
+        const command = try std.fmt.allocPrint(std.testing.allocator, "git command {d}", .{index});
+        defer std.testing.allocator.free(command);
+        try insertHistoryRecord(history.db, .{
+            .cmd = command,
+            .cwd = "/repo",
+            .when = @intCast(index + 1),
+            .session_id = "worker-session",
+        });
+    }
+
+    var service = InteractiveHistoryService.init(&history);
+    defer service.deinit();
+    try service.startQueryWorker(std.testing.allocator, std.testing.io);
+    const async = service.lineEditorView(std.testing.io).async.?;
+
+    try async.submit(async.context, .{ .suggest = .{
+        .prefix = "git command 2",
+        .token = .{ .line_epoch = 1, .generation = 1 },
+    } });
+    const suggestion_completion = try waitForHistoryWorkerResult(service.query_worker.?);
+    defer suggestion_completion.deinit(std.testing.allocator);
+    const suggestion = switch (suggestion_completion.result) {
+        .entry => |maybe_entry| maybe_entry orelse return error.TestExpectedHistorySuggestion,
+        .entries => return error.TestExpectedHistorySuggestion,
+    };
+    try std.testing.expectEqualStrings("git command 24", suggestion.text);
+    try std.testing.expectEqual(@as(u64, 2), service.query_worker.?.stats().suggestion_statement_executions);
+
+    try async.submit(async.context, .{ .search = .{
+        .query = "git",
+        .filters = .{},
+        .before = null,
+        .token = .{ .line_epoch = 1, .generation = 2 },
+    } });
+    const search_completion = try waitForHistoryWorkerResult(service.query_worker.?);
+    defer search_completion.deinit(std.testing.allocator);
+    const entries = switch (search_completion.result) {
+        .entries => |page| page,
+        .entry => return error.TestExpectedHistorySearchPage,
+    };
+    try std.testing.expectEqual(@as(usize, 20), entries.len);
+    for (entries, 0..) |entry, index| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "git command {d}", .{24 - index});
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, entry.text);
+    }
+    try std.testing.expectEqual(@as(u64, 1), service.query_worker.?.stats().search_statement_executions);
+}
+
+fn waitForHistoryWorkerResult(worker: *HistoryQueryWorker) !editor_history.Completion {
+    var loop = try event_loop.EventLoop.init();
+    defer loop.deinit();
+    try loop.addReadFd(worker.wakeFd(), .history_async);
+    var events: [1]event_loop.Event = undefined;
+    const ready = try loop.waitTimeout(&events, 5000);
+    if (ready.len == 0) return error.TestHistoryWorkerTimeout;
+    worker.drainWake();
+    return try worker.takeResult(std.testing.allocator) orelse error.TestExpectedHistoryWorkerResult;
 }
 
 test "line history walks session commands then history from session start" {

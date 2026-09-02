@@ -31,6 +31,7 @@ pub const Options = struct {
 
 pub fn run(
     allocator: std.mem.Allocator,
+    root_allocator: std.mem.Allocator,
     real_host: host.RealHost,
     // ziglint-ignore: Z023 parameter order follows method or callback shape; preserve API
     io: std.Io,
@@ -76,6 +77,15 @@ pub fn run(
     }
     command_history.session_id = history.sessionId(allocator, io) catch "";
     var history_service = history.InteractiveHistoryService.init(&command_history);
+    defer history_service.deinit();
+    history_service.startQueryWorker(root_allocator, io) catch |err| {
+        const message = try std.fmt.allocPrint(
+            sh.scratchAllocator(),
+            "rush: asynchronous history unavailable ({s}); using synchronous history\n",
+            .{@errorName(err)},
+        );
+        try sh.host.writeAll(.stderr, message);
+    };
     sh.setCommandHistory(history_service.commandHistory(io));
     sh.state.prompt_history_number = history_service.nextCommandNumber() catch 1;
 

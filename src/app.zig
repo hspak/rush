@@ -55,13 +55,20 @@ pub fn run(
                 .environ = init.environ,
             });
             defer threaded_io.deinit();
-            return interactive.run(process_allocator, real_host, threaded_io.io(), init.environ.block.view().slice, .{
-                .state_options = interactive_invocation.options,
-                .arg_zero = interactive_invocation.arg_zero,
-                .positionals = &.{},
-                .login = interactive_invocation.login,
-                .forced_interactive = interactive_invocation.forced_interactive,
-            });
+            return interactive.run(
+                process_allocator,
+                root_allocator,
+                real_host,
+                threaded_io.io(),
+                init.environ.block.view().slice,
+                .{
+                    .state_options = interactive_invocation.options,
+                    .arg_zero = interactive_invocation.arg_zero,
+                    .positionals = &.{},
+                    .login = interactive_invocation.login,
+                    .forced_interactive = interactive_invocation.forced_interactive,
+                },
+            );
         },
         .command_string => |command| {
             const src: shell.source.Source = .{
