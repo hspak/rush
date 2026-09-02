@@ -272,6 +272,21 @@ pub fn write(_: RealHost, fd: host.Fd, bytes: []const u8) WriteError!usize {
     };
 }
 
+pub fn seekTo(_: RealHost, fd: host.Fd, offset: u64) host.SeekError!void {
+    const signed_offset = std.math.cast(i64, offset) orelse return error.Unexpected;
+    switch (builtin.os.tag) {
+        .linux => {
+            const rc = std.os.linux.lseek(fd.raw(), signed_offset, std.os.linux.SEEK.SET);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.Unexpected;
+        },
+        .macos, .freebsd, .openbsd, .netbsd => {
+            const rc = std.c.lseek(@intCast(fd.raw()), @intCast(signed_offset), std.c.SEEK.SET);
+            if (std.c.errno(rc) != .SUCCESS) return error.Unexpected;
+        },
+        else => @compileError("unsupported host OS"),
+    }
+}
+
 pub fn openZ(_: RealHost, path: [:0]const u8, options: host.OpenOptions) OpenError!host.Fd {
     std.debug.assert(path.len != 0);
     return switch (builtin.os.tag) {

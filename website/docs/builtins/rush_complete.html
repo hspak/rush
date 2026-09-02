@@ -39,7 +39,7 @@
 
   <h2 id="commands"><a href="#commands">COMMANDS</a></h2>
   <dl>
-    <dt><code>candidate</code></dt><dd>Add one candidate. Supported kinds include <code>plain</code>, <code>file</code>, <code>directory</code>, <code>subcommand</code>, <code>option</code>, <code>variable</code>, <code>function</code>, <code>command</code>, and <code>builtin</code>. <code>--priority</code> accepts a signed 8-bit integer. Higher values prefer a candidate among otherwise comparable matches; Rush still performs final query-aware ordering. Omit it for priority <code>0</code>, use small positive bands for contextual preference, and negative values are allowed specifically to derank fallback candidates.</dd>
+    <dt><code>candidate</code></dt><dd>Add one candidate. Candidate emissions from pipeline child processes are collected by the parent provider. Supported kinds include <code>plain</code>, <code>file</code>, <code>directory</code>, <code>subcommand</code>, <code>option</code>, <code>variable</code>, <code>function</code>, <code>command</code>, and <code>builtin</code>. <code>--priority</code> accepts a signed 8-bit integer. Higher values prefer a candidate among otherwise comparable matches; Rush still performs final query-aware ordering. Omit it for priority <code>0</code>, use small positive bands for contextual preference, and negative values are allowed specifically to derank fallback candidates.</dd>
     <dt><code>files</code></dt><dd>Add path candidates matching the current completion prefix.</dd>
     <dt><code>directories</code></dt><dd>Add directory candidates matching the current completion prefix.</dd>
     <dt><code>aliases</code></dt><dd>Add alias-name candidates from the current shell state.</dd>

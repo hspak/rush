@@ -49,6 +49,21 @@ pub const CompletionParsedOperand = struct {
     index: usize,
 };
 
+/// Process-safe representation written by `rush_complete candidate` and
+/// collected by the parent completion provider.
+pub const CompletionCandidateWire = struct {
+    value: []const u8,
+    display: ?[]const u8 = null,
+    insert: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
+    suffix: ?[]const u8 = null,
+    removable_suffix: bool = false,
+    priority: i8 = 0,
+    kind: completion.Kind = .plain,
+    append_space: bool = true,
+};
+
 /// Borrows parsed completion inputs and deeply owns candidates appended by
 /// `rush_complete` until they are taken or the context is deinitialized.
 pub const CompletionContext = struct {
@@ -66,6 +81,9 @@ pub const CompletionContext = struct {
     value_position: []const u8,
     parsed_options: []const CompletionParsedOption,
     operands: []const CompletionParsedOperand,
+    /// Inherited provider side channel used when candidate emission may occur
+    /// in a pipeline child process.
+    candidate_fd: ?host.Fd = null,
     candidates: std.ArrayList(completion.Candidate) = .empty,
     next_source_order: usize = 0,
 
@@ -1167,7 +1185,7 @@ fn evalRushComplete(state: *State, sh: anytype, args: []const []const u8) !resul
         return .{ .status = 2 };
     };
     if (args.len < 2) return .{ .status = 2 };
-    if (std.mem.eql(u8, args[1], "candidate")) return rushCompleteCandidate(context, args);
+    if (std.mem.eql(u8, args[1], "candidate")) return rushCompleteCandidate(context, sh, args);
     if (std.mem.eql(u8, args[1], "files")) return rushCompletePaths(context, sh, args, false);
     if (std.mem.eql(u8, args[1], "directories")) return rushCompletePaths(context, sh, args, true);
     if (std.mem.eql(u8, args[1], "aliases")) return rushCompleteNames(context, sh.state.aliases, .plain, "alias");
@@ -1181,7 +1199,7 @@ fn evalRushComplete(state: *State, sh: anytype, args: []const []const u8) !resul
     return .{ .status = 2 };
 }
 
-fn rushCompleteCandidate(context: *CompletionContext, args: []const []const u8) !result.EvalResult {
+fn rushCompleteCandidate(context: *CompletionContext, sh: anytype, args: []const []const u8) !result.EvalResult {
     if (args.len < 3) return .{ .status = 2 };
     var candidate: completion.Candidate = .{
         .value = try context.allocator.dupe(u8, args[2]),
@@ -1226,8 +1244,7 @@ fn rushCompleteCandidate(context: *CompletionContext, args: []const []const u8) 
             candidate.append_space = false;
         } else return .{ .status = 2 };
     }
-    try context.candidates.append(context.allocator, candidate);
-    context.next_source_order += 1;
+    try emitCompletionCandidate(context, sh, candidate);
     return .{};
 }
 
@@ -1643,6 +1660,37 @@ fn appendCompletionCandidate(
         .source_order = context.next_source_order,
     });
     context.next_source_order += 1;
+}
+
+fn emitCompletionCandidate(context: *CompletionContext, sh: anytype, candidate: completion.Candidate) !void {
+    const candidate_fd = context.candidate_fd orelse {
+        try context.candidates.append(context.allocator, candidate);
+        context.next_source_order += 1;
+        return;
+    };
+    const wire: CompletionCandidateWire = .{
+        .value = candidate.value,
+        .display = candidate.display,
+        .insert = candidate.insert,
+        .description = candidate.description,
+        .tag = candidate.tag,
+        .suffix = candidate.suffix,
+        .removable_suffix = candidate.removable_suffix,
+        .priority = candidate.priority,
+        .kind = candidate.kind,
+        .append_space = candidate.append_space,
+    };
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    var json_writer: std.json.Stringify = .{
+        .writer = &output.writer,
+        .options = .{},
+    };
+    try json_writer.write(wire);
+    try output.writer.writeByte('\n');
+    const record = output.written();
+    if (try sh.host.write(candidate_fd, record) != record.len) return error.Unexpected;
+    freeCompletionCandidateFields(context.allocator, candidate);
 }
 
 fn parseCompletionKind(value: []const u8) ?completion.Kind {

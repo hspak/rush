@@ -747,6 +747,85 @@ fn appendStaticValues(allocator: std.mem.Allocator, builder: *Builder, analyzed:
     }
 }
 
+const CandidateChannel = struct {
+    fd: host.Fd,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, real_host: *host.RealHost) !CandidateChannel {
+        var attempts: usize = 0;
+        while (attempts < 8) : (attempts += 1) {
+            var random: u64 = undefined;
+            io.random(std.mem.asBytes(&random));
+            const path = try std.fmt.allocPrintSentinel(
+                allocator,
+                "/tmp/rush-completion-{x}.jsonl",
+                .{random},
+                0,
+            );
+            const opened_fd = real_host.openZ(path, .{
+                .access = .read_write,
+                .create = true,
+                .append = true,
+                .exclusive = true,
+                .mode = 0o600,
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    allocator.free(path);
+                    continue;
+                },
+                else => {
+                    allocator.free(path);
+                    return err;
+                },
+            };
+            const fd = real_host.duplicateAtLeast(opened_fd, 3) catch |err| {
+                // ziglint-ignore: Z026 best-effort cleanup while returning the primary error
+                real_host.close(opened_fd) catch {};
+                // ziglint-ignore: Z026 best-effort cleanup while returning the primary error
+                real_host.deleteFileZ(path) catch {};
+                allocator.free(path);
+                return err;
+            };
+            real_host.close(opened_fd) catch {
+                // ziglint-ignore: Z026 best-effort cleanup while returning the close error
+                real_host.close(fd) catch {};
+                // ziglint-ignore: Z026 best-effort cleanup while returning the close error
+                real_host.deleteFileZ(path) catch {};
+                allocator.free(path);
+                return error.Unexpected;
+            };
+            real_host.deleteFileZ(path) catch {
+                // ziglint-ignore: Z026 best-effort cleanup while returning the unlink error
+                real_host.close(fd) catch {};
+                allocator.free(path);
+                return error.Unexpected;
+            };
+            allocator.free(path);
+            return .{ .fd = fd };
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn deinit(self: *CandidateChannel, real_host: *host.RealHost) void {
+        // ziglint-ignore: Z026 intentional best-effort cleanup; preserve primary completion result
+        real_host.close(self.fd) catch {};
+        self.* = undefined;
+    }
+};
+
+test "candidate channel never occupies a standard descriptor" {
+    var real_host: host.RealHost = .{};
+    const saved_stdin = try real_host.duplicate(.stdin);
+    defer {
+        real_host.duplicateTo(saved_stdin, .stdin) catch unreachable;
+        real_host.close(saved_stdin) catch unreachable;
+    }
+    try real_host.close(.stdin);
+
+    var channel = try CandidateChannel.init(std.testing.allocator, std.testing.io, &real_host);
+    defer channel.deinit(&real_host);
+    try std.testing.expect(channel.fd.raw() >= 3);
+}
+
 fn appendFunctionProvider(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -781,6 +860,9 @@ fn appendFunctionProvider(
         operands,
     );
     defer provider_context.deinit();
+    var candidate_channel = try CandidateChannel.init(allocator, io, &sh.host);
+    defer candidate_channel.deinit(&sh.host);
+    provider_context.candidate_fd = candidate_channel.fd;
 
     const previous_context = sh.extensions.completion_context;
     sh.extensions.completion_context = &provider_context;
@@ -804,9 +886,51 @@ fn appendFunctionProvider(
     const evaluated = sh.evalSourceNested(src) catch return;
     if (evaluated.status != 0 or evaluated.flow != .normal) return;
 
+    try sh.host.seekTo(candidate_channel.fd, 0);
+    try appendCandidateChannel(allocator, sh, builder, analyzed, candidate_channel.fd);
+
     const candidates = try provider_context.takeCandidates();
     defer editor_completion.freeCandidates(allocator, candidates);
     for (candidates) |candidate| try builder.append(allocator, candidate);
+}
+
+fn appendCandidateChannel(
+    allocator: std.mem.Allocator,
+    sh: anytype,
+    builder: *Builder,
+    analyzed: AnalyzedLine,
+    fd: host.Fd,
+) !void {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const read_len = try sh.host.read(fd, &buffer);
+        if (read_len == 0) break;
+        try input.appendSlice(allocator, buffer[0..read_len]);
+    }
+
+    var lines = std.mem.splitScalar(u8, input.items, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(extensions.rush.CompletionCandidateWire, allocator, line, .{});
+        defer parsed.deinit();
+        const wire = parsed.value;
+        try builder.append(allocator, .{
+            .value = wire.value,
+            .display = wire.display,
+            .insert = wire.insert,
+            .description = wire.description,
+            .tag = wire.tag,
+            .suffix = wire.suffix,
+            .removable_suffix = wire.removable_suffix,
+            .priority = wire.priority,
+            .kind = wire.kind,
+            .replace_start = analyzed.replace_start,
+            .replace_end = analyzed.replace_end,
+            .append_space = wire.append_space,
+        });
+    }
 }
 
 fn parsedOptionsForProvider(
@@ -1544,6 +1668,93 @@ test "completion loads dynamic subcommands from manifest providers" {
     return error.ExpectedDynamicSubcommandCandidate;
 }
 
+test "yay target providers retain candidates from package command output" {
+    var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(std.testing.allocator, .{}, .{});
+    defer sh.deinit();
+
+    const fixture: shell.source.Source = .{
+        .id = 0,
+        .kind = .command_string,
+        .name = "yay completion fixture",
+        .text =
+        \\pacman() {
+        \\  rush_complete candidate producer-stage --kind plain --description producer
+        \\  case "$1" in
+        \\    -Slq) printf 'available-one\navailable-two\n' ;;
+        \\    -Sgq) printf 'group-one\n' ;;
+        \\    -Qq) printf 'installed-one\ninstalled-two\n' ;;
+        \\  esac
+        \\}
+        ,
+    };
+    const evaluated = try sh.evalSourceNested(fixture);
+    try std.testing.expectEqual(@as(u8, 0), evaluated.status);
+
+    const cases = [_]struct {
+        source: []const u8,
+        expected: [3][]const u8,
+    }{
+        .{ .source = "yay -S ", .expected = .{ "producer-stage", "available-one", "available-two" } },
+        .{ .source = "yay -R ", .expected = .{ "producer-stage", "installed-one", "installed-two" } },
+    };
+    for (cases) |case| {
+        var application = try complete(&sh, std.testing.allocator, std.testing.io, case.source, case.source.len);
+        defer application.deinit(std.testing.allocator);
+        const candidates = switch (application) {
+            .ambiguous => |candidates| candidates,
+            else => return error.ExpectedYayPackageCandidates,
+        };
+        for (case.expected) |expected| {
+            for (candidates) |candidate| {
+                if (std.mem.eql(u8, candidate.value, expected)) break;
+            } else return error.ExpectedYayPackageCandidate;
+        }
+    }
+}
+
+test "zmx attach provider retains candidates from session list output" {
+    var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(std.testing.allocator, .{}, .{});
+    defer sh.deinit();
+
+    const fixture: shell.source.Source = .{
+        .id = 0,
+        .kind = .command_string,
+        .name = "zmx completion fixture",
+        .text =
+        \\zmx() {
+        \\  printf 'name=dev\tpid=1\tclients=0\tcreated=0\tcwd=/tmp/dev\n'
+        \\  printf 'name=work\tpid=2\tclients=1\tcreated=0\tcwd=/tmp/work\n'
+        \\}
+        ,
+    };
+    const evaluated = try sh.evalSourceNested(fixture);
+    try std.testing.expectEqual(@as(u8, 0), evaluated.status);
+
+    const source = "zmx attach ";
+    var application = try complete(&sh, std.testing.allocator, std.testing.io, source, source.len);
+    defer application.deinit(std.testing.allocator);
+    const candidates = switch (application) {
+        .ambiguous => |candidates| candidates,
+        else => return error.ExpectedZmxSessionCandidates,
+    };
+    var found_dev = false;
+    var found_work = false;
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.value, "dev")) {
+            try std.testing.expectEqualStrings("active session, /tmp/dev", candidate.description.?);
+            try std.testing.expectEqual(@as(i8, 20), candidate.priority);
+            found_dev = true;
+        }
+        if (std.mem.eql(u8, candidate.value, "work")) {
+            try std.testing.expectEqualStrings("active session, 1 client, /tmp/work", candidate.description.?);
+            try std.testing.expectEqual(@as(i8, 30), candidate.priority);
+            found_work = true;
+        }
+    }
+    try std.testing.expect(found_dev);
+    try std.testing.expect(found_work);
+}
+
 test "completion includes dynamic option provider candidates" {
     var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(std.testing.allocator, .{}, .{});
     defer sh.deinit();
@@ -1563,7 +1774,11 @@ test "completion includes dynamic option provider candidates" {
     };
     var found_release_safe = false;
     for (candidates) |candidate| {
-        if (std.mem.eql(u8, candidate.value, "-Doptimize=ReleaseSafe")) found_release_safe = true;
+        if (std.mem.eql(u8, candidate.value, "-Doptimize=ReleaseSafe")) {
+            try std.testing.expectEqual(editor_completion.Kind.option, candidate.kind);
+            try std.testing.expectEqualStrings("safe release build", candidate.description.?);
+            found_release_safe = true;
+        }
     }
     try std.testing.expect(found_release_safe);
     try std.testing.expectEqualStrings("original", sh.state.getVariable("rush_completion_prefix").?.value);

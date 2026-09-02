@@ -38,7 +38,7 @@ __rush_complete_zmx_sessions() {
     __rush_complete_zmx_session_selected "$value" && continue
 
     clients=
-    start_dir=
+    cwd=
     ended=
     exit_code=
     unreachable=
@@ -47,7 +47,7 @@ __rush_complete_zmx_sessions() {
       field=${rest%%"$tab"*}
       case "$field" in
         clients=*) clients=${field#clients=} ;;
-        start_dir=*) start_dir=${field#start_dir=} ;;
+        cwd=*) cwd=${field#cwd=} ;;
         ended=*) ended=${field#ended=} ;;
         exit_code=*) exit_code=${field#exit_code=} ;;
         err=*) unreachable=${field#err=} ;;
@@ -74,7 +74,7 @@ __rush_complete_zmx_sessions() {
       *) description="$description, $clients clients"; priority=30 ;;
     esac
     test "$current" = true && priority=60
-    test -n "$start_dir" && description="$description, $start_dir"
+    test -n "$cwd" && description="$description, $cwd"
 
     rush_complete candidate "$value" --kind plain --description "$description" --priority "$priority"
   done

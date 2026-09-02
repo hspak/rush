@@ -40,6 +40,8 @@ pub const OpenOptions = struct {
     mode: u32 = 0o666,
 };
 
+pub const SeekError = error{Unexpected};
+
 pub const Pipe = struct {
     read: Fd,
     write: Fd,
