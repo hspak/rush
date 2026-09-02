@@ -498,9 +498,8 @@ fn serializeFrameDiff(
 
     var current_row = previous.cursor_row;
     var cursor_positioned = false;
-    if (try appendSingleLineGrowth(allocator, &output, previous, frame)) {
-        current_row = 0;
-        cursor_positioned = frame.cursor_col == visibleWidth(frame.lines[0], frame.width_method);
+    if (try appendCursorLineGrowth(allocator, &output, previous, frame)) {
+        cursor_positioned = frame.cursor_col == visibleWidth(frame.lines[frame.cursor_row], frame.width_method);
     } else {
         const max_lines = @max(previous.lines.len, frame.lines.len);
         for (0..max_lines) |row| {
@@ -532,7 +531,7 @@ fn serializeFrameDiff(
     return output.toOwnedSlice(allocator);
 }
 
-fn appendSingleLineGrowth(
+fn appendCursorLineGrowth(
     allocator: std.mem.Allocator,
     output: *std.ArrayList(u8),
     previous: Frame,
@@ -541,15 +540,20 @@ fn appendSingleLineGrowth(
     // Reuse the existing cells only when the terminal cursor is at the old
     // row's end. Re-establish the style at that point because a previous
     // multi-row diff may have left the terminal in a lower row's style.
-    if (previous.lines.len != 1 or frame.lines.len != 1 or
-        previous.cursor_row != 0 or frame.cursor_row != 0 or
+    if (previous.lines.len == 0 or previous.lines.len != frame.lines.len or
+        previous.cursor_row != frame.cursor_row or
+        previous.cursor_row >= previous.lines.len or
         previous.width_method != frame.width_method)
     {
         return false;
     }
 
-    const old_line = previous.lines[0];
-    const new_line = frame.lines[0];
+    for (previous.lines, frame.lines, 0..) |old_line, new_line, row| {
+        if (row != previous.cursor_row and !std.mem.eql(u8, old_line, new_line)) return false;
+    }
+
+    const old_line = previous.lines[previous.cursor_row];
+    const new_line = frame.lines[frame.cursor_row];
     if (previous.cursor_col != visibleWidth(old_line, previous.width_method) or
         old_line.len >= new_line.len or
         !std.mem.startsWith(u8, new_line, old_line))

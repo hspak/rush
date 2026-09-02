@@ -194,6 +194,8 @@ pub const LineSession = struct {
     history_search_query: std.ArrayList(u8) = .empty,
     history_search_original: std.ArrayList(u8) = .empty,
     history_search_matches: std.ArrayList(HistoryView.HistoryEntry) = .empty,
+    history_search_result_query: std.ArrayList(u8) = .empty,
+    history_search_has_result: bool = false,
     history_search_selected: usize = 0,
     history_search_filters: HistorySearchFilters = .{},
     history_search_direction: ViHistoryDirection = .backward,
@@ -263,6 +265,7 @@ pub const LineSession = struct {
         self.clearAutosuggestionMiss();
         self.clearAutosuggestion();
         self.history_search_matches.deinit(self.allocator);
+        self.history_search_result_query.deinit(self.allocator);
         self.history_search_original.deinit(self.allocator);
         self.history_search_query.deinit(self.allocator);
         self.vi_last_history_search_pattern.deinit(self.allocator);
@@ -2232,12 +2235,16 @@ pub const LineSession = struct {
                 for (styled_labels.items) |label| allocator.free(label);
                 styled_labels.deinit(allocator);
             }
+            const result_query = if (self.history_search_has_result)
+                self.history_search_result_query.items
+            else
+                self.history_search_query.items;
             if (self.history_search_matches.items.len != 0) {
                 for (self.history_search_matches.items) |entry| {
                     const label = try styledHistorySearchLabel(
                         allocator,
                         entry.text,
-                        self.history_search_query.items,
+                        result_query,
                         render_options.theme,
                     );
                     try styled_labels.append(allocator, label);
@@ -2261,7 +2268,7 @@ pub const LineSession = struct {
                         };
                     }
                 }
-            } else {
+            } else if (self.history_search_has_result) {
                 history_label_width = visibleWidth("No history matches", render_options.width_method);
                 try history_candidates.append(allocator, .{
                     .value = self.history_search_query.items,
@@ -2415,8 +2422,11 @@ pub const LineSession = struct {
     }
 
     fn beginHistorySearch(self: *LineSession, direction: ViHistoryDirection) !void {
+        self.clearHistorySearchMatches();
         self.history_search_query.clearRetainingCapacity();
         self.history_search_original.clearRetainingCapacity();
+        self.history_search_result_query.clearRetainingCapacity();
+        self.history_search_has_result = false;
         try self.history_search_original.appendSlice(self.allocator, self.editor.buffer.text());
         try self.history_search_query.appendSlice(self.allocator, self.editor.buffer.text());
         self.history_search_filters = .{};
@@ -2536,7 +2546,6 @@ pub const LineSession = struct {
     }
 
     fn refreshHistorySearch(self: *LineSession, before: ?i64) !void {
-        self.clearHistorySearchMatches();
         self.history_search_selected = 0;
         const token = self.nextHistoryQueryToken();
         self.requests.put(self.allocator, .{ .history = .{ .search = .{
@@ -2548,7 +2557,6 @@ pub const LineSession = struct {
     }
 
     fn refreshHistorySearchNext(self: *LineSession, after: ?i64) !void {
-        self.clearHistorySearchMatches();
         self.history_search_selected = 0;
         const token = self.nextHistoryQueryToken();
         self.requests.put(self.allocator, .{ .history = .{ .search_next = .{
@@ -2580,10 +2588,38 @@ pub const LineSession = struct {
             for (entries) |entry| entry.deinit(self.allocator);
             self.allocator.free(entries);
         }
-        const changed = entries.len != 0;
-        try self.history_search_matches.appendSlice(self.allocator, entries);
+
+        var completed_query: std.ArrayList(u8) = .empty;
+        errdefer completed_query.deinit(self.allocator);
+        try completed_query.appendSlice(self.allocator, query);
+        var completed_matches: std.ArrayList(HistoryView.HistoryEntry) = .empty;
+        errdefer completed_matches.deinit(self.allocator);
+        try completed_matches.appendSlice(self.allocator, entries);
+
+        const entries_changed = !historySearchEntriesEqual(self.history_search_matches.items, entries);
+        const query_changes_labels = (self.history_search_matches.items.len != 0 or entries.len != 0) and
+            !std.mem.eql(u8, self.history_search_result_query.items, query);
+        const changed = !self.history_search_has_result or entries_changed or query_changes_labels;
         self.allocator.free(entries);
+
+        self.clearHistorySearchMatches();
+        self.history_search_matches.deinit(self.allocator);
+        self.history_search_matches = completed_matches;
+        self.history_search_result_query.deinit(self.allocator);
+        self.history_search_result_query = completed_query;
+        self.history_search_has_result = true;
         return changed;
+    }
+
+    fn historySearchEntriesEqual(
+        current: []const HistoryView.HistoryEntry,
+        completed: []const HistoryView.HistoryEntry,
+    ) bool {
+        if (current.len != completed.len) return false;
+        for (current, completed) |old, new| {
+            if (old.id != new.id or old.when != new.when or !std.mem.eql(u8, old.text, new.text)) return false;
+        }
+        return true;
     }
 
     fn selectedHistorySearchMatch(self: LineSession) ?HistoryView.HistoryEntry {
@@ -2622,6 +2658,8 @@ pub const LineSession = struct {
         self.clearHistorySearchMatches();
         self.history_search_query.clearRetainingCapacity();
         self.history_search_original.clearRetainingCapacity();
+        self.history_search_result_query.clearRetainingCapacity();
+        self.history_search_has_result = false;
         self.state = .editing;
         self.cancelHistoryQuery();
     }
@@ -5516,6 +5554,11 @@ test "history search renders clean no-match menu state" {
 
     try session.handleKey(.{ .key = .text, .text = "missing" });
     try session.handleKey(.{ .key = .ctrl_r });
+
+    const pending = try session.render(std.testing.allocator, .{ .synchronized_output = false });
+    defer std.testing.allocator.free(pending);
+    try std.testing.expect(std.mem.indexOf(u8, pending, "No history matches") == null);
+
     try applyTestHistoryRequests(&session);
 
     try std.testing.expectEqual(LineSession.State.history_search, session.state);
@@ -5527,6 +5570,43 @@ test "history search renders clean no-match menu state" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "No history matches") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[2mmissing") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "history `") == null);
+}
+
+test "history search retains completed page while replacement is pending" {
+    const entries = [_][]const u8{ "git status", "git diff", "git show" };
+    var history: TestHistorySearch = .{ .entries = &entries };
+    var session = try LineSession.initWithOptions(std.testing.allocator, .{ .bytes = "$ " }, .{
+        .context = &history,
+        .search = testSearchHistoryEntry,
+    });
+    defer session.deinit();
+    var renderer: FrameRenderer = .{};
+    defer renderer.deinit(std.testing.allocator);
+
+    try session.handleKey(.{ .key = .ctrl_r });
+    try applyTestHistoryRequests(&session);
+    var completed_frame = try session.renderFrame(std.testing.allocator, .{ .synchronized_output = false });
+    defer completed_frame.deinit(std.testing.allocator);
+    const completed_output = try renderer.render(
+        std.testing.allocator,
+        completed_frame,
+        .{ .synchronized_output = false },
+    );
+    defer std.testing.allocator.free(completed_output);
+
+    try session.handleKey(.{ .key = .text, .text = " " });
+    var pending_frame = try session.renderFrame(std.testing.allocator, .{ .synchronized_output = false });
+    defer pending_frame.deinit(std.testing.allocator);
+    const pending_output = try renderer.render(
+        std.testing.allocator,
+        pending_frame,
+        .{ .synchronized_output = false },
+    );
+    defer std.testing.allocator.free(pending_output);
+
+    try std.testing.expectEqual(@as(usize, entries.len), session.history_search_matches.items.len);
+    try std.testing.expectEqualStrings("", session.history_search_result_query.items);
+    try std.testing.expectEqualStrings("\x1b[m ", pending_output);
 }
 
 test "history search filter toggles refresh the current query" {
