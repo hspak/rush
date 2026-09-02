@@ -26,7 +26,7 @@ pub fn complete(
     cursor: usize,
 ) !Application {
     const sh = rushShellFromOpaque(context);
-    const analyzed = try analyzeLine(allocator, source, cursor);
+    var analyzed = try analyzeLine(allocator, source, cursor);
     defer analyzed.deinit(allocator);
 
     var builder: Builder = .{};
@@ -60,7 +60,7 @@ pub fn complete(
 
     if (!analyzed.completing_redirection_target) {
         if (analyzed.root) |root| {
-            if (try completeFromManifest(allocator, io, sh, &builder, analyzed, root)) |handled| {
+            if (try completeFromManifest(allocator, io, sh, &builder, &analyzed, root)) |handled| {
                 if (handled) return applyBuiltCandidates(allocator, source, &builder, analyzed);
             }
         }
@@ -215,6 +215,27 @@ fn analyzeLine(allocator: std.mem.Allocator, source: []const u8, raw_cursor: usi
     };
 }
 
+fn selectAttachedOptionValue(allocator: std.mem.Allocator, analyzed: *AnalyzedLine, offset: usize) !void {
+    std.debug.assert(offset <= analyzed.prefix.len);
+    const current_word = analyzed.words[analyzed.current_word_index.?];
+    const replace_start = analyzed.replace_start + offset;
+    std.debug.assert(replace_start >= current_word.start);
+    const word_offset = replace_start - current_word.start;
+    std.debug.assert(word_offset <= current_word.text.len);
+
+    const prefix = analyzed.prefix[offset..];
+    const literal_prefix = try shell.word_quoting.parseLiteralWord(allocator, prefix);
+    errdefer if (literal_prefix) |literal| literal.deinit(allocator);
+    const literal_query = try shell.word_quoting.parseLiteralWord(allocator, current_word.text[word_offset..]);
+
+    if (analyzed.literal_prefix) |literal| literal.deinit(allocator);
+    if (analyzed.literal_query) |literal| literal.deinit(allocator);
+    analyzed.replace_start = replace_start;
+    analyzed.prefix = prefix;
+    analyzed.literal_prefix = literal_prefix;
+    analyzed.literal_query = literal_query;
+}
+
 /// Returns the offset just past the opener of the innermost `$(` or backquote
 /// substitution left unclosed in `text`, or null when every substitution is
 /// closed. Single quotes suppress openers; double quotes do not.
@@ -363,7 +384,7 @@ fn completeFromManifest(
     io: std.Io,
     sh: anytype,
     builder: *Builder,
-    analyzed: AnalyzedLine,
+    analyzed: *AnalyzedLine,
     root: []const u8,
 ) !?bool {
     const manifest_path = try findCompletionFile(allocator, sh, root, ".json") orelse return null;
@@ -416,7 +437,7 @@ fn completeFromManifest(
             io,
             sh,
             builder,
-            analyzed,
+            analyzed.*,
             semantic,
             command_path.commands(),
             command,
@@ -428,13 +449,16 @@ fn completeFromManifest(
     }
 
     if (semantic.option_value_provider) |provider| {
+        if (semantic.attached_option_value_offset) |offset| {
+            try selectAttachedOptionValue(allocator, analyzed, offset);
+        }
         // ziglint-ignore: Z024 preserve existing readable expression shape; lint-only cleanup
         try appendProviderCandidates(
             allocator,
             io,
             sh,
             builder,
-            analyzed,
+            analyzed.*,
             semantic,
             command,
             current,
@@ -455,7 +479,7 @@ fn completeFromManifest(
                     io,
                     sh,
                     builder,
-                    analyzed,
+                    analyzed.*,
                     semantic,
                     command,
                     current,
@@ -475,7 +499,7 @@ fn completeFromManifest(
             io,
             sh,
             builder,
-            analyzed,
+            analyzed.*,
             semantic,
             command,
             current,
@@ -1547,6 +1571,28 @@ test "completion includes dynamic option provider candidates" {
     try std.testing.expectEqualStrings("original", sh.state.getVariable("project_option_count").?.value);
     try std.testing.expectEqual(@as(?shell.state.Variable, null), sh.state.getVariable("tmp"));
     try std.testing.expectEqual(@as(?shell.state.Variable, null), sh.state.getVariable("in_project_options"));
+}
+
+test "completion provides values attached to a long option" {
+    var sh = shell.ShellWithBuiltins(host.RealHost, extensions.rush.registry).init(std.testing.allocator, .{}, .{});
+    defer sh.deinit();
+
+    const source = "zig build --color=o";
+    var application = try complete(&sh, std.testing.allocator, std.testing.io, source, source.len);
+    defer application.deinit(std.testing.allocator);
+    const candidates = switch (application) {
+        .ambiguous => |candidates| candidates,
+        else => return error.ExpectedAttachedOptionValueCandidates,
+    };
+    var found_off = false;
+    var found_on = false;
+    for (candidates) |candidate| {
+        try std.testing.expectEqual(@as(usize, "zig build --color=".len), candidate.replace_start);
+        if (std.mem.eql(u8, candidate.value, "off")) found_off = true;
+        if (std.mem.eql(u8, candidate.value, "on")) found_on = true;
+    }
+    try std.testing.expect(found_off);
+    try std.testing.expect(found_on);
 }
 
 test "provider context preserves root options before a subcommand" {

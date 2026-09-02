@@ -15,6 +15,7 @@ pub const Semantic = struct {
     complete_options: bool = false,
     complete_subcommands: bool = false,
     option_value_provider: ?std.json.Value = null,
+    attached_option_value_offset: ?usize = null,
 };
 
 pub fn semanticContext(
@@ -81,6 +82,25 @@ pub fn semanticContext(
             .options_terminated = options_terminated,
             .option_value_provider = jsonField(value, "provider"),
         };
+    }
+
+    if (!options_terminated and prefix.len != 0 and prefix[0] == '-') {
+        if (optionTokenForContext(command_path[0..command_path_len], prefix)) |parsed| {
+            if (parsed.value) |attached_value| {
+                const value = optionValueAt(parsed.option, 0) orelse return .{
+                    .operand_index = operand_index,
+                    .options_terminated = options_terminated,
+                };
+                if (jsonField(value, "provider")) |provider| {
+                    return .{
+                        .operand_index = operand_index,
+                        .options_terminated = options_terminated,
+                        .option_value_provider = provider,
+                        .attached_option_value_offset = prefix.len - attached_value.len,
+                    };
+                }
+            }
+        }
     }
 
     const prefix_is_option = prefix.len != 0 and prefix[0] == '-' and !options_terminated;
