@@ -164,6 +164,7 @@ pub const TerminalSession = struct {
     color_scheme: ColorScheme = .unknown,
     winsize: vaxis.Winsize,
     events: std.ArrayList(TerminalEvent) = .empty,
+    next_history_line_epoch: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !TerminalSession {
         const tty_buffer = try allocator.alloc(u8, 4096);
@@ -407,16 +408,30 @@ pub const TerminalSession = struct {
         }
         var read_options = options;
 
+        if (read_options.history.async) |async| {
+            try self.loop.addReadFd(async.wake_fd, .history_async);
+        }
+        defer if (read_options.history.async) |async| {
+            // ziglint-ignore: Z026 best-effort unregistration during line teardown
+            self.loop.removeFd(async.wake_fd) catch {};
+        };
+
         var session = try line_editor.LineSession.initWithEditingMode(self.allocator, .{
             .bytes = read_options.prompt,
             .visible_width = line_editor.visibleWidth(read_options.prompt, self.capabilities.widthMethod()),
         }, read_options.history, read_options.editing_mode);
         defer session.deinit();
+        session.setHistoryLineEpoch(self.next_history_line_epoch);
+        self.next_history_line_epoch +%= 1;
+        if (self.next_history_line_epoch == 0) self.next_history_line_epoch = 1;
+        defer if (read_options.history.async) |async| async.cancel(async.context);
         try session.replaceRightPrompt(.{
             .bytes = read_options.right_prompt,
             .visible_width = line_editor.visibleWidth(read_options.right_prompt, self.capabilities.widthMethod()),
         });
 
+        try session.requestAutosuggestion();
+        _ = try self.processHistoryRequests(read_options, &session);
         try writeTtyAll(&self.tty, semantic_command_start);
         try renderSession(
             self.allocator,
@@ -497,6 +512,7 @@ pub const TerminalSession = struct {
                         .prompt_async => {
                             if (read_options.pump_prompt_async) |pump| pump(read_options.prompt_async_context.?);
                         },
+                        .history_async => {},
                         .child_signal => {
                             self.processChildSignal();
                             hook_ready = true;
@@ -615,6 +631,9 @@ pub const TerminalSession = struct {
                     }
                 }
                 if (session.state == .editing or session.state == .history_search) {
+                    try session.requestAutosuggestion();
+                    if (try self.processHistoryRequests(read_options, &session)) render_needed = true;
+                    if (self.processAsyncHistoryResults(read_options, &session)) render_needed = true;
                     if (render_needed) {
                         if (session.takePromptInvalidation() and
                             read_options.refresh_prompt != null and
@@ -683,6 +702,8 @@ pub const TerminalSession = struct {
                         try session.acceptExternalEditorResult(text);
                     } else {
                         session.resumeEditingAfterExternalEditor();
+                        try session.requestAutosuggestion();
+                        _ = try self.processHistoryRequests(read_options, &session);
                         try renderSession(
                             self.allocator,
                             self.io,
@@ -883,6 +904,32 @@ pub const TerminalSession = struct {
         return drainHistoryRequests(self.allocator, options.history, session);
     }
 
+    fn processAsyncHistoryResults(
+        self: *TerminalSession,
+        options: ReadLineOptions,
+        session: *line_editor.LineSession,
+    ) bool {
+        const async = options.history.async orelse return false;
+        async.drain_wake(async.context);
+        var applied = false;
+        while (true) {
+            const maybe_completion = async.take_result(async.context, self.allocator) catch |err| {
+                log.debug("failed to collect asynchronous history result: {}", .{err});
+                return applied;
+            };
+            const history_completion = maybe_completion orelse return applied;
+            defer history_completion.request.deinit(self.allocator);
+            const changed = session.applyAsyncHistoryResult(
+                history_completion.request,
+                history_completion.result,
+            ) catch |err| {
+                log.debug("failed to apply asynchronous history result: {}", .{err});
+                return applied;
+            };
+            applied = applied or changed;
+        }
+    }
+
     fn processPathExpansionRequest(
         self: *TerminalSession,
         options: ReadLineOptions,
@@ -992,6 +1039,21 @@ fn drainHistoryRequests(
     var processed = false;
     while (session.takeHistoryRequest()) |request| {
         defer request.deinit(allocator);
+        if (history.async) |async| switch (request) {
+            .suggest, .search, .search_next => {
+                async.submit(async.context, request) catch {
+                    const result = emptyHistoryResult(request);
+                    try session.applyHistoryResult(request, result);
+                    processed = true;
+                };
+                continue;
+            },
+            .cancel_async => {
+                async.cancel(async.context);
+                continue;
+            },
+            else => {},
+        };
         processed = true;
         const result = try resolveHistoryRequest(allocator, history, request);
         try session.applyHistoryResult(request, result);
@@ -1034,10 +1096,11 @@ fn resolveHistoryRequest(
             search.filters,
             search.after,
         ) },
-        .suggest => |prefix| .{ .entry = if (history.suggest) |callback|
-            try callback(context, allocator, prefix)
+        .suggest => |suggest| .{ .entry = if (history.suggest) |callback|
+            try callback(context, allocator, suggest.prefix)
         else
             null },
+        .cancel_async => .{ .entry = null },
     };
 }
 
@@ -1048,6 +1111,7 @@ fn emptyHistoryResult(request: line_editor.HistoryRequest) line_editor.HistoryRe
         .next,
         .by_number,
         .suggest,
+        .cancel_async,
         => .{ .entry = null },
     };
 }
@@ -1289,8 +1353,6 @@ fn renderSession(
     winsize: vaxis.Winsize,
     options: ReadLineOptions,
 ) !void {
-    try session.requestAutosuggestion();
-    _ = try drainHistoryRequests(allocator, options.history, session);
     const diagnostic = if (options.diagnose != null and options.diagnostic_context != null)
         try options.diagnose.?(options.diagnostic_context.?, allocator, io, session.editor.buffer.text())
     else

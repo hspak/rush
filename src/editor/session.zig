@@ -198,6 +198,13 @@ pub const LineSession = struct {
     history_search_filters: HistorySearchFilters = .{},
     history_search_direction: ViHistoryDirection = .backward,
     autosuggestion: ?HistoryView.HistoryEntry = null,
+    autosuggestion_pending: ?struct {
+        token: history_mod.QueryToken,
+        prefix: []const u8,
+    } = null,
+    autosuggestion_miss_prefix: ?[]const u8 = null,
+    history_line_epoch: u64 = 0,
+    history_query_generation: u64 = 0,
     vi_history_search_query: std.ArrayList(u8) = .empty,
     vi_last_history_search_pattern: std.ArrayList(u8) = .empty,
     vi_last_history_search_direction: ?ViHistoryDirection = null,
@@ -252,6 +259,8 @@ pub const LineSession = struct {
         self.requests.deinit(self.allocator);
         self.clearPendingRemovableSuffix();
         self.clearHistorySearchMatches();
+        self.clearPendingAutosuggestion();
+        self.clearAutosuggestionMiss();
         self.clearAutosuggestion();
         self.history_search_matches.deinit(self.allocator);
         self.history_search_original.deinit(self.allocator);
@@ -273,6 +282,12 @@ pub const LineSession = struct {
         self.allocator.free(self.prompt.bytes);
         if (self.right_prompt.bytes.len != 0) self.allocator.free(self.right_prompt.bytes);
         self.* = undefined;
+    }
+
+    pub fn setHistoryLineEpoch(self: *LineSession, epoch: u64) void {
+        std.debug.assert(epoch != 0);
+        std.debug.assert(self.history_line_epoch == 0);
+        self.history_line_epoch = epoch;
     }
 
     pub fn handleKey(self: *LineSession, event: KeyEvent) !void {
@@ -1370,18 +1385,50 @@ pub const LineSession = struct {
 
     /// Borrows `request` and consumes the deeply owned `result`.
     pub fn applyHistoryResult(self: *LineSession, request: HistoryRequest, result: HistoryResult) !void {
-        switch (request) {
-            .previous => |previous| try self.applyPreviousHistoryResult(
-                previous.prefix,
-                previous.before,
+        _ = try self.applyHistoryResultInner(request, result);
+    }
+
+    /// Applies a worker completion and reports whether visible editor state changed.
+    pub fn applyAsyncHistoryResult(self: *LineSession, request: HistoryRequest, result: HistoryResult) !bool {
+        std.debug.assert(request == .suggest or request == .search or request == .search_next);
+        return self.applyHistoryResultInner(request, result);
+    }
+
+    fn applyHistoryResultInner(self: *LineSession, request: HistoryRequest, result: HistoryResult) !bool {
+        return switch (request) {
+            .previous => |previous| blk: {
+                try self.applyPreviousHistoryResult(
+                    previous.prefix,
+                    previous.before,
+                    historyResultEntry(result),
+                );
+                break :blk true;
+            },
+            .next => |next| blk: {
+                try self.applyNextHistoryResult(next.prefix, next.after, historyResultEntry(result));
+                break :blk true;
+            },
+            .by_number => |number| blk: {
+                try self.applyHistoryByNumberResult(number, historyResultEntry(result));
+                break :blk true;
+            },
+            .search => |search| self.applyHistorySearchResult(search.query, search.filters, search.token, result),
+            .search_next => |search| self.applyHistorySearchResult(
+                search.query,
+                search.filters,
+                search.token,
+                result,
+            ),
+            .suggest => |suggest| self.applyAutosuggestionResult(
+                suggest.prefix,
+                suggest.token,
                 historyResultEntry(result),
             ),
-            .next => |next| try self.applyNextHistoryResult(next.prefix, next.after, historyResultEntry(result)),
-            .by_number => |number| try self.applyHistoryByNumberResult(number, historyResultEntry(result)),
-            .search => |search| try self.applyHistorySearchResult(search.query, search.filters, result),
-            .search_next => |search| try self.applyHistorySearchResult(search.query, search.filters, result),
-            .suggest => |prefix| try self.applyAutosuggestionResult(prefix, historyResultEntry(result)),
-        }
+            .cancel_async => blk: {
+                result.deinit(self.allocator);
+                break :blk false;
+            },
+        };
     }
 
     fn historyResultEntry(result: HistoryResult) ?HistoryView.HistoryEntry {
@@ -2491,20 +2538,24 @@ pub const LineSession = struct {
     fn refreshHistorySearch(self: *LineSession, before: ?i64) !void {
         self.clearHistorySearchMatches();
         self.history_search_selected = 0;
+        const token = self.nextHistoryQueryToken();
         self.requests.put(self.allocator, .{ .history = .{ .search = .{
             .query = try self.allocator.dupe(u8, self.history_search_query.items),
             .filters = self.history_search_filters,
             .before = before,
+            .token = token,
         } } });
     }
 
     fn refreshHistorySearchNext(self: *LineSession, after: ?i64) !void {
         self.clearHistorySearchMatches();
         self.history_search_selected = 0;
+        const token = self.nextHistoryQueryToken();
         self.requests.put(self.allocator, .{ .history = .{ .search_next = .{
             .query = try self.allocator.dupe(u8, self.history_search_query.items),
             .filters = self.history_search_filters,
             .after = after,
+            .token = token,
         } } });
     }
 
@@ -2512,19 +2563,27 @@ pub const LineSession = struct {
         self: *LineSession,
         query: []const u8,
         filters: HistorySearchFilters,
+        token: history_mod.QueryToken,
         result: HistoryResult,
-    ) !void {
-        if (!std.mem.eql(u8, query, self.history_search_query.items) or filters != self.history_search_filters) {
+    ) !bool {
+        if (self.state != .history_search or
+            token.line_epoch != self.history_line_epoch or
+            token.generation != self.history_query_generation or
+            !std.mem.eql(u8, query, self.history_search_query.items) or
+            filters != self.history_search_filters)
+        {
             result.deinit(self.allocator);
-            return;
+            return false;
         }
         const entries = historyResultEntries(result);
         errdefer {
             for (entries) |entry| entry.deinit(self.allocator);
             self.allocator.free(entries);
         }
+        const changed = entries.len != 0;
         try self.history_search_matches.appendSlice(self.allocator, entries);
         self.allocator.free(entries);
+        return changed;
     }
 
     fn selectedHistorySearchMatch(self: LineSession) ?HistoryView.HistoryEntry {
@@ -2564,32 +2623,137 @@ pub const LineSession = struct {
         self.history_search_query.clearRetainingCapacity();
         self.history_search_original.clearRetainingCapacity();
         self.state = .editing;
+        self.cancelHistoryQuery();
     }
 
     pub fn requestAutosuggestion(self: *LineSession) !void {
-        self.clearAutosuggestion();
-        if (self.state != .editing) return;
-        if (self.completion_menu.isOpen()) return;
-        if (self.editor.buffer.cursor_byte != self.editor.buffer.text().len) return;
-        if (self.editor.buffer.text().len == 0) return;
+        const text = self.editor.buffer.text();
+        const eligible = self.state == .editing and
+            !self.completion_menu.isOpen() and
+            self.editor.buffer.cursor_byte == text.len and
+            text.len != 0;
+        if (!eligible) {
+            self.clearAutosuggestion();
+            self.clearAutosuggestionMiss();
+            if (self.state == .history_search) {
+                // The search request has already superseded any outstanding
+                // suggestion; canceling here would also cancel that search.
+                self.clearPendingAutosuggestion();
+                return;
+            }
+            self.cancelPendingAutosuggestion();
+            return;
+        }
+        if (self.autosuggestion) |entry| {
+            if (entry.text.len > text.len and
+                std.mem.startsWith(u8, entry.text, text) and
+                renderableInlineText(entry.text))
+            {
+                return;
+            }
+            self.clearAutosuggestion();
+        }
+        if (self.autosuggestion_miss_prefix) |miss_prefix| {
+            if (std.mem.eql(u8, miss_prefix, text)) return;
+            self.clearAutosuggestionMiss();
+        }
+        if (self.autosuggestion_pending) |pending| {
+            if (std.mem.eql(u8, pending.prefix, text)) return;
+            self.clearPendingAutosuggestion();
+        }
+        const token = self.nextHistoryQueryToken();
+        self.autosuggestion_pending = .{
+            .token = token,
+            .prefix = try self.allocator.dupe(u8, text),
+        };
+        errdefer self.clearPendingAutosuggestion();
         self.requests.put(self.allocator, .{ .history = .{
-            .suggest = try self.allocator.dupe(u8, self.editor.buffer.text()),
+            .suggest = .{
+                .prefix = try self.allocator.dupe(u8, text),
+                .token = token,
+            },
         } });
     }
 
-    fn applyAutosuggestionResult(self: *LineSession, prefix: []const u8, maybe_entry: ?HistoryView.HistoryEntry) !void {
-        self.clearAutosuggestion();
-        const entry = maybe_entry orelse return;
-        errdefer entry.deinit(self.allocator);
-        if (!std.mem.eql(u8, prefix, self.editor.buffer.text())) {
-            entry.deinit(self.allocator);
-            return;
+    fn applyAutosuggestionResult(
+        self: *LineSession,
+        prefix: []const u8,
+        token: history_mod.QueryToken,
+        maybe_entry: ?HistoryView.HistoryEntry,
+    ) !bool {
+        const pending = self.autosuggestion_pending orelse {
+            if (maybe_entry) |entry| entry.deinit(self.allocator);
+            return false;
+        };
+        if (token.line_epoch != self.history_line_epoch or
+            token.generation != self.history_query_generation or
+            token.line_epoch != pending.token.line_epoch or
+            token.generation != pending.token.generation or
+            !std.mem.eql(u8, prefix, pending.prefix))
+        {
+            if (maybe_entry) |entry| entry.deinit(self.allocator);
+            return false;
         }
-        if (!std.mem.startsWith(u8, entry.text, prefix)) {
+        self.clearPendingAutosuggestion();
+        if (self.state != .editing or
+            self.completion_menu.isOpen() or
+            self.editor.buffer.cursor_byte != self.editor.buffer.text().len or
+            !std.mem.eql(u8, prefix, self.editor.buffer.text()))
+        {
+            if (maybe_entry) |entry| entry.deinit(self.allocator);
+            return false;
+        }
+        const entry = maybe_entry orelse {
+            self.autosuggestion_miss_prefix = try self.allocator.dupe(u8, prefix);
+            return false;
+        };
+        errdefer entry.deinit(self.allocator);
+        if (!std.mem.startsWith(u8, entry.text, prefix) or
+            entry.text.len <= prefix.len or
+            !renderableInlineText(entry.text))
+        {
+            const miss_prefix = try self.allocator.dupe(u8, prefix);
             entry.deinit(self.allocator);
-            return;
+            self.autosuggestion_miss_prefix = miss_prefix;
+            return false;
         }
         self.autosuggestion = entry;
+        return true;
+    }
+
+    fn nextHistoryQueryToken(self: *LineSession) history_mod.QueryToken {
+        self.history_query_generation +%= 1;
+        if (self.history_query_generation == 0) self.history_query_generation = 1;
+        return .{
+            .line_epoch = self.history_line_epoch,
+            .generation = self.history_query_generation,
+        };
+    }
+
+    fn cancelPendingAutosuggestion(self: *LineSession) void {
+        if (self.autosuggestion_pending == null) return;
+        self.clearPendingAutosuggestion();
+        // A newly queued search request supersedes the suggestion by itself;
+        // do not replace that request with a standalone cancellation.
+        if (self.requests.contains(.history)) return;
+        self.cancelHistoryQuery();
+    }
+
+    fn cancelHistoryQuery(self: *LineSession) void {
+        self.requests.put(self.allocator, .{
+            .history = .{ .cancel_async = self.nextHistoryQueryToken() },
+        });
+    }
+
+    fn clearPendingAutosuggestion(self: *LineSession) void {
+        const pending = self.autosuggestion_pending orelse return;
+        self.allocator.free(pending.prefix);
+        self.autosuggestion_pending = null;
+    }
+
+    fn clearAutosuggestionMiss(self: *LineSession) void {
+        if (self.autosuggestion_miss_prefix) |prefix| self.allocator.free(prefix);
+        self.autosuggestion_miss_prefix = null;
     }
 
     fn clearAutosuggestion(self: *LineSession) void {
@@ -3125,10 +3289,7 @@ test "line session undo restores accepted autosuggestions as one step" {
     try session.handleKey(.{ .key = .text, .text = "g" });
     try session.handleKey(.{ .key = .text, .text = "i" });
     try session.handleKey(.{ .key = .text, .text = "t" });
-    try session.applyAutosuggestionResult("git", .{
-        .id = 1,
-        .text = try std.testing.allocator.dupe(u8, "git status"),
-    });
+    try applyTestAutosuggestion(&session, "git status", 1);
 
     try session.handleKey(.{ .key = .right });
     try std.testing.expectEqualStrings("git status", session.editor.buffer.text());
@@ -3138,26 +3299,123 @@ test "line session undo restores accepted autosuggestions as one step" {
     try std.testing.expectEqualStrings("", session.editor.buffer.text());
 }
 
+test "autosuggestion planning reuses pending and still-valid results" {
+    var session = try LineSession.init(std.testing.allocator, "");
+    defer session.deinit();
+
+    try session.handleKey(.{ .key = .text, .text = "git" });
+    try session.requestAutosuggestion();
+    try session.requestAutosuggestion();
+    const request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer request.deinit(std.testing.allocator);
+    const suggest = switch (request) {
+        .suggest => |value| value,
+        else => return error.TestExpectedAutosuggestionRequest,
+    };
+    try std.testing.expect(session.takeHistoryRequest() == null);
+
+    _ = try session.applyAutosuggestionResult(suggest.prefix, suggest.token, .{
+        .id = 1,
+        .text = try std.testing.allocator.dupe(u8, "git status"),
+    });
+    try session.handleKey(.{ .key = .text, .text = " " });
+    try session.requestAutosuggestion();
+    try std.testing.expect(session.takeHistoryRequest() == null);
+    try std.testing.expectEqualStrings("git status", session.autosuggestion.?.text);
+}
+
+test "autosuggestion planning does not repeat a completed miss on unchanged input" {
+    var session = try LineSession.init(std.testing.allocator, "");
+    defer session.deinit();
+
+    try session.handleKey(.{ .key = .text, .text = "git" });
+    try session.requestAutosuggestion();
+    const miss_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer miss_request.deinit(std.testing.allocator);
+    const miss = switch (miss_request) {
+        .suggest => |value| value,
+        else => return error.TestExpectedAutosuggestionRequest,
+    };
+    _ = try session.applyAutosuggestionResult(miss.prefix, miss.token, null);
+
+    try session.requestAutosuggestion();
+    try std.testing.expect(session.takeHistoryRequest() == null);
+
+    try session.handleKey(.{ .key = .text, .text = " " });
+    try session.requestAutosuggestion();
+    const extended_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer extended_request.deinit(std.testing.allocator);
+    try std.testing.expect(extended_request == .suggest);
+}
+
+test "autosuggestion rejects a stale generation after prefix divergence" {
+    var session = try LineSession.init(std.testing.allocator, "");
+    defer session.deinit();
+
+    try session.handleKey(.{ .key = .text, .text = "g" });
+    try session.requestAutosuggestion();
+    const old_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer old_request.deinit(std.testing.allocator);
+    const old_suggest = switch (old_request) {
+        .suggest => |value| value,
+        else => return error.TestExpectedAutosuggestionRequest,
+    };
+
+    try session.handleKey(.{ .key = .text, .text = "i" });
+    try session.requestAutosuggestion();
+    const new_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer new_request.deinit(std.testing.allocator);
+    const new_suggest = switch (new_request) {
+        .suggest => |value| value,
+        else => return error.TestExpectedAutosuggestionRequest,
+    };
+    _ = try session.applyAutosuggestionResult(old_suggest.prefix, old_suggest.token, .{
+        .id = 1,
+        .text = try std.testing.allocator.dupe(u8, "git status"),
+    });
+    try std.testing.expect(session.autosuggestion == null);
+    try std.testing.expectEqual(new_suggest.token.generation, session.autosuggestion_pending.?.token.generation);
+}
+
+test "entering history search supersedes a pending autosuggestion without canceling search" {
+    var session = try LineSession.init(std.testing.allocator, "");
+    defer session.deinit();
+    session.setHistoryLineEpoch(9);
+
+    try session.handleKey(.{ .key = .text, .text = "g" });
+    try session.requestAutosuggestion();
+    const suggest_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer suggest_request.deinit(std.testing.allocator);
+    try std.testing.expect(suggest_request == .suggest);
+
+    try session.handleKey(.{ .key = .ctrl_r });
+    const search_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer search_request.deinit(std.testing.allocator);
+    const search = switch (search_request) {
+        .search => |request| request,
+        else => return error.TestExpectedHistorySearchRequest,
+    };
+    try session.requestAutosuggestion();
+
+    try std.testing.expect(session.takeHistoryRequest() == null);
+    try std.testing.expectEqual(search.token.generation, session.history_query_generation);
+    try std.testing.expect(session.autosuggestion_pending == null);
+}
+
 test "vi insert mode accepts autosuggestion with right and end at eol" {
     var session = try LineSession.initWithEditingMode(std.testing.allocator, .{ .bytes = "" }, .{}, .vi);
     defer session.deinit();
     try std.testing.expectEqual(ViState.insert, session.vi_state);
 
     try session.handleKey(.{ .key = .text, .text = "git" });
-    try session.applyAutosuggestionResult("git", .{
-        .id = 1,
-        .text = try std.testing.allocator.dupe(u8, "git status"),
-    });
+    try applyTestAutosuggestion(&session, "git status", 1);
     try session.handleKey(.{ .key = .right });
     try std.testing.expectEqualStrings("git status", session.editor.buffer.text());
     try std.testing.expect(session.autosuggestion == null);
 
     try session.handleKey(.{ .key = .undo });
     try std.testing.expectEqualStrings("git", session.editor.buffer.text());
-    try session.applyAutosuggestionResult("git", .{
-        .id = 2,
-        .text = try std.testing.allocator.dupe(u8, "git status --short"),
-    });
+    try applyTestAutosuggestion(&session, "git status --short", 2);
     try session.handleKey(.{ .key = .end });
     try std.testing.expectEqualStrings("git status --short", session.editor.buffer.text());
 }
@@ -3168,10 +3426,7 @@ test "vi insert mode right at mid-line does not accept autosuggestion" {
 
     try session.handleKey(.{ .key = .text, .text = "git " });
     try session.handleKey(.{ .key = .text, .text = "st" });
-    try session.applyAutosuggestionResult("git st", .{
-        .id = 1,
-        .text = try std.testing.allocator.dupe(u8, "git status"),
-    });
+    try applyTestAutosuggestion(&session, "git status", 1);
     // Cursor mid-line: left twice from "git st"
     try session.handleKey(.{ .key = .left });
     try session.handleKey(.{ .key = .left });
@@ -5096,6 +5351,20 @@ fn applyTestHistoryRequests(session: *LineSession) !void {
     }
 }
 
+fn applyTestAutosuggestion(session: *LineSession, text: []const u8, id: i64) !void {
+    try session.requestAutosuggestion();
+    const request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer request.deinit(std.testing.allocator);
+    const suggest = switch (request) {
+        .suggest => |value| value,
+        else => return error.TestExpectedAutosuggestionRequest,
+    };
+    _ = try session.applyAutosuggestionResult(suggest.prefix, suggest.token, .{
+        .id = id,
+        .text = try std.testing.allocator.dupe(u8, text),
+    });
+}
+
 fn resolveTestHistoryRequest(history: HistoryView, request: HistoryRequest) !HistoryResult {
     const context = history.context orelse return switch (request) {
         .search, .search_next => .{ .entries = try std.testing.allocator.alloc(HistoryView.HistoryEntry, 0) },
@@ -5103,6 +5372,7 @@ fn resolveTestHistoryRequest(history: HistoryView, request: HistoryRequest) !His
         .next,
         .by_number,
         .suggest,
+        .cancel_async,
         => .{ .entry = null },
     };
     return switch (request) {
@@ -5132,10 +5402,11 @@ fn resolveTestHistoryRequest(history: HistoryView, request: HistoryRequest) !His
             search.filters,
             search.after,
         ) },
-        .suggest => |prefix| .{ .entry = if (history.suggest) |callback|
-            try callback(context, std.testing.allocator, prefix)
+        .suggest => |suggest| .{ .entry = if (history.suggest) |callback|
+            try callback(context, std.testing.allocator, suggest.prefix)
         else
             null },
+        .cancel_async => .{ .entry = null },
     };
 }
 
@@ -5326,6 +5597,38 @@ test "history search cancel restores original and enter accepts match" {
     try accept.handleKey(.{ .key = .enter });
     try std.testing.expectEqual(LineSession.State.editing, accept.state);
     try std.testing.expectEqualStrings("git diff", accept.editor.buffer.text());
+}
+
+test "history search exit invalidates an in-flight page" {
+    var session = try LineSession.init(std.testing.allocator, "$ ");
+    defer session.deinit();
+    session.setHistoryLineEpoch(7);
+
+    try session.handleKey(.{ .key = .ctrl_r });
+    const search_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer search_request.deinit(std.testing.allocator);
+    const search_token = switch (search_request) {
+        .search => |search| search.token,
+        else => return error.TestExpectedHistorySearchRequest,
+    };
+
+    try session.handleKey(.{ .key = .escape });
+    const cancel_request = session.takeHistoryRequest() orelse return error.TestExpectedHistoryRequest;
+    defer cancel_request.deinit(std.testing.allocator);
+    const cancel_token = switch (cancel_request) {
+        .cancel_async => |token| token,
+        else => return error.TestExpectedHistoryCancellation,
+    };
+    try std.testing.expect(cancel_token.generation > search_token.generation);
+
+    const stale_entries = try std.testing.allocator.alloc(HistoryView.HistoryEntry, 1);
+    stale_entries[0] = .{
+        .id = 1,
+        .text = try std.testing.allocator.dupe(u8, "stale command"),
+    };
+    try session.applyHistoryResult(search_request, .{ .entries = stale_entries });
+    try std.testing.expectEqual(LineSession.State.editing, session.state);
+    try std.testing.expectEqual(@as(usize, 0), session.history_search_matches.items.len);
 }
 
 test "history search edits query while staying open" {

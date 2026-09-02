@@ -15,6 +15,11 @@ pub const Entry = struct {
     }
 };
 
+pub const QueryToken = struct {
+    line_epoch: u64,
+    generation: u64,
+};
+
 pub const View = struct {
     pub const HistoryEntry = Entry;
 
@@ -43,6 +48,19 @@ pub const View = struct {
         ?i64,
     ) anyerror!?HistoryEntry = null,
     suggest: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?HistoryEntry = null,
+    async: ?Async = null,
+
+    pub const Async = struct {
+        context: *anyopaque,
+        wake_fd: std.posix.fd_t,
+        /// Borrows `request`; the provider must copy anything retained after
+        /// this call returns.
+        submit: *const fn (*anyopaque, Request) anyerror!void,
+        cancel: *const fn (*anyopaque) void,
+        drain_wake: *const fn (*anyopaque) void,
+        /// Returns a deeply owned completion allocated by `allocator`.
+        take_result: *const fn (*anyopaque, std.mem.Allocator) anyerror!?Completion,
+    };
 };
 
 pub const SearchFilters = packed struct(u3) {
@@ -56,9 +74,23 @@ pub const Request = union(enum) {
     previous: struct { prefix: []const u8, before: ?i64 },
     next: struct { prefix: []const u8, after: i64 },
     by_number: usize,
-    search: struct { query: []const u8, filters: SearchFilters, before: ?i64 },
-    search_next: struct { query: []const u8, filters: SearchFilters, after: ?i64 },
-    suggest: []const u8,
+    search: struct {
+        query: []const u8,
+        filters: SearchFilters,
+        before: ?i64,
+        token: QueryToken = .{ .line_epoch = 0, .generation = 0 },
+    },
+    search_next: struct {
+        query: []const u8,
+        filters: SearchFilters,
+        after: ?i64,
+        token: QueryToken = .{ .line_epoch = 0, .generation = 0 },
+    },
+    suggest: struct {
+        prefix: []const u8,
+        token: QueryToken = .{ .line_epoch = 0, .generation = 0 },
+    },
+    cancel_async: QueryToken,
 
     pub fn deinit(self: Request, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -66,8 +98,8 @@ pub const Request = union(enum) {
             .next => |request| allocator.free(request.prefix),
             .search => |request| allocator.free(request.query),
             .search_next => |request| allocator.free(request.query),
-            .suggest => |prefix| allocator.free(prefix),
-            .by_number => {},
+            .suggest => |request| allocator.free(request.prefix),
+            .by_number, .cancel_async => {},
         }
     }
 };
@@ -86,6 +118,16 @@ pub const Result = union(enum) {
                 allocator.free(entries);
             },
         }
+    }
+};
+
+pub const Completion = struct {
+    request: Request,
+    result: Result,
+
+    pub fn deinit(self: Completion, allocator: std.mem.Allocator) void {
+        self.request.deinit(allocator);
+        self.result.deinit(allocator);
     }
 };
 
